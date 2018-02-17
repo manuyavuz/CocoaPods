@@ -78,13 +78,13 @@ module Pod
       end
 
       it 'returns the directory where a local Pod is stored' do
-        @sandbox.store_local_path('BananaLib', Pathname.new('Some Path'))
+        @sandbox.store_local_path('BananaLib', Pathname.new('Some Path/BananaLib.podspec'))
         @sandbox.pod_dir('BananaLib').should.be == Pathname.new('Some Path')
       end
 
       it 'handles symlinks in /tmp' do
         tmp_sandbox = Pod::Sandbox.new('/tmp/CocoaPods')
-        tmp_sandbox.root.should.be == Pathname.new('/private/tmp/CocoaPods')
+        tmp_sandbox.root.should.be == Pathname.new('/tmp/CocoaPods').realpath
         require 'fileutils'
         FileUtils.rm_rf(tmp_sandbox.root)
       end
@@ -104,10 +104,14 @@ module Pod
         spec = Specification.from_file(spec_file)
         Specification.expects(:from_file).with do
           Dir.pwd == fixture('banana-lib').to_s
-        end.twice.returns(spec)
+        end.once.returns(spec)
+
+        Specification.expects(:from_file).with do |path|
+          path == spec_file
+        end.once.returns(spec)
 
         @sandbox.store_podspec('BananaLib', spec_file)
-        @sandbox.store_local_path('BananaLib', fixture('banana-lib'))
+        @sandbox.store_local_path('BananaLib', spec_file)
         @sandbox.specification('BananaLib')
       end
 
@@ -156,20 +160,6 @@ module Pod
 
       #--------------------------------------#
 
-      it 'stores the list of the names of the pre-downloaded pods' do
-        @sandbox.store_head_pod('BananaLib')
-        @sandbox.head_pods.should == ['BananaLib']
-      end
-
-      it 'returns whether a Pod has been pre-downloaded' do
-        @sandbox.head_pods << 'BananaLib'
-        @sandbox.head_pod?('BananaLib').should.be.true
-        @sandbox.head_pod?('BananaLib/Subspec').should.be.true
-        @sandbox.head_pod?('Monkey').should.be.false
-      end
-
-      #--------------------------------------#
-
       it 'returns the checkout sources of the Pods' do
         @sandbox.store_pre_downloaded_pod('BananaLib/Subspec')
         @sandbox.predownloaded_pods.should == ['BananaLib']
@@ -190,17 +180,17 @@ module Pod
       #--------------------------------------#
 
       it 'stores the local path of a Pod' do
-        @sandbox.store_local_path('BananaLib/Subspec', Pathname.new('Some Path'))
-        @sandbox.development_pods['BananaLib'].should == 'Some Path'
+        @sandbox.store_local_path('BananaLib/Subspec', Pathname.new('Some Path/BananaLib.podspec'))
+        @sandbox.development_pods['BananaLib'].should == Pathname.new('Some Path/BananaLib.podspec')
       end
 
       it 'returns the path of the local pods grouped by name' do
-        @sandbox.store_local_path('BananaLib', 'Some Path')
-        @sandbox.development_pods.should == { 'BananaLib' => 'Some Path' }
+        @sandbox.store_local_path('BananaLib', 'BananaLib/BananaLib.podspec')
+        @sandbox.development_pods.should == { 'BananaLib' => Pathname.new('BananaLib/BananaLib.podspec') }
       end
 
       it 'returns whether a Pod is local' do
-        @sandbox.store_local_path('BananaLib', Pathname.new('Some Path'))
+        @sandbox.store_local_path('BananaLib', Pathname.new('BananaLib/BananaLib.podspec'))
         @sandbox.local?('BananaLib').should.be.true
         @sandbox.local?('BananaLib/Subspec').should.be.true
         @sandbox.local?('Monkey').should.be.false

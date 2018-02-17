@@ -16,8 +16,12 @@ module Pod
         #
         # @param  [Target] target @see target
         #
-        def initialize(target)
+        # @param  [Boolean] test_xcconfig
+        #         whether this is an xcconfig for a test native target.
+        #
+        def initialize(target, test_xcconfig = false)
           @target = target
+          @test_xcconfig = test_xcconfig
         end
 
         # @return [Xcodeproj::Config] The generated xcconfig.
@@ -40,38 +44,37 @@ module Pod
         # @return [Xcodeproj::Config]
         #
         def generate
-          target_search_paths = target.build_headers.search_paths(target.platform)
-          sandbox_search_paths = target.sandbox.public_headers.search_paths(target.platform)
-          search_paths = target_search_paths.concat(sandbox_search_paths).uniq
-
           config = {
-            'OTHER_LDFLAGS' => XCConfigHelper.default_ld_flags(target),
-            'PODS_ROOT' => '${SRCROOT}',
-            'HEADER_SEARCH_PATHS' => XCConfigHelper.quote(search_paths),
+            'FRAMEWORK_SEARCH_PATHS' => '$(inherited) ',
             'GCC_PREPROCESSOR_DEFINITIONS' => '$(inherited) COCOAPODS=1',
+            'HEADER_SEARCH_PATHS' => XCConfigHelper.quote(target.header_search_paths(@test_xcconfig)),
+            'LIBRARY_SEARCH_PATHS' => '$(inherited) ',
+            'OTHER_LDFLAGS' => XCConfigHelper.default_ld_flags(target, @test_xcconfig),
+            'PODS_ROOT' => '${SRCROOT}',
+            'PODS_TARGET_SRCROOT' => target.pod_target_srcroot,
+            'PRODUCT_BUNDLE_IDENTIFIER' => 'org.cocoapods.${PRODUCT_NAME:rfc1034identifier}',
             'SKIP_INSTALL' => 'YES',
-            'FRAMEWORK_SEARCH_PATHS' => '$(inherited) '
+            'SWIFT_ACTIVE_COMPILATION_CONDITIONS' => '$(inherited) ',
             # 'USE_HEADERMAP' => 'NO'
           }
 
           @xcconfig = Xcodeproj::Config.new(config)
 
-          if target.requires_frameworks? && target.scoped?
-            # Only quote the FRAMEWORK_SEARCH_PATHS entry, because it’s a setting that takes multiple values.
-            # In addition, quoting CONFIGURATION_BUILD_DIR would make it be interpreted as a relative path.
-            build_settings = {
-              'PODS_FRAMEWORK_BUILD_PATH' => target.configuration_build_dir,
-              'FRAMEWORK_SEARCH_PATHS' => '"$PODS_FRAMEWORK_BUILD_PATH"',
-              'CONFIGURATION_BUILD_DIR' => '$PODS_FRAMEWORK_BUILD_PATH',
-            }
-            @xcconfig.merge!(build_settings)
-          end
-
-          XCConfigHelper.add_settings_for_file_accessors_of_target(target, @xcconfig)
+          XCConfigHelper.add_settings_for_file_accessors_of_target(nil, target, @xcconfig, true, @test_xcconfig)
           target.file_accessors.each do |file_accessor|
-            @xcconfig.merge!(file_accessor.spec_consumer.pod_target_xcconfig)
+            @xcconfig.merge!(file_accessor.spec_consumer.pod_target_xcconfig) if @test_xcconfig == file_accessor.spec.test_specification?
           end
           XCConfigHelper.add_target_specific_settings(target, @xcconfig)
+          recursive_dependent_targets = target.recursive_dependent_targets
+          @xcconfig.merge! XCConfigHelper.search_paths_for_dependent_targets(target, recursive_dependent_targets, @test_xcconfig)
+          XCConfigHelper.generate_vendored_build_settings(target, recursive_dependent_targets, @xcconfig, false, @test_xcconfig) if target.requires_frameworks?
+          if @test_xcconfig
+            test_dependent_targets = [target, *target.recursive_test_dependent_targets].uniq
+            @xcconfig.merge! XCConfigHelper.search_paths_for_dependent_targets(target, test_dependent_targets - recursive_dependent_targets, @test_xcconfig)
+            XCConfigHelper.generate_vendored_build_settings(nil, target.all_dependent_targets, @xcconfig, true, @test_xcconfig)
+            XCConfigHelper.generate_other_ld_flags(nil, target.all_dependent_targets, @xcconfig)
+            XCConfigHelper.generate_ld_runpath_search_paths(target, false, true, @xcconfig)
+          end
           @xcconfig
         end
 

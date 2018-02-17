@@ -2,7 +2,7 @@ module Pod
   class Command
     class Spec < Command
       class Lint < Spec
-        self.summary = 'Validates a spec file.'
+        self.summary = 'Validates a spec file'
 
         self.description = <<-DESC
           Validates `NAME.podspec`. If a `DIRECTORY` is provided, it validates
@@ -27,6 +27,10 @@ module Pod
              '(defaults to https://github.com/CocoaPods/Specs.git). ' \
              'Multiple sources must be comma-delimited.'],
             ['--private', 'Lint skips checks that apply only to public specs'],
+            ['--swift-version=VERSION', 'The SWIFT_VERSION that should be used to lint the spec. ' \
+             'This takes precedence over a .swift-version file.'],
+            ['--skip-import-validation', 'Lint skips validating that the pod can be imported'],
+            ['--skip-tests', 'Lint skips building and running tests during validation'],
           ].concat(super)
         end
 
@@ -40,7 +44,10 @@ module Pod
           @use_frameworks  = !argv.flag?('use-libraries')
           @source_urls     = argv.option('sources', 'https://github.com/CocoaPods/Specs.git').split(',')
           @private         = argv.flag?('private', false)
-          @podspecs_paths  = argv.arguments!
+          @swift_version   = argv.option('swift-version', nil)
+          @skip_import_validation = argv.flag?('skip-import-validation', false)
+          @skip_tests = argv.flag?('skip-tests', false)
+          @podspecs_paths = argv.arguments!
           super
         end
 
@@ -57,6 +64,9 @@ module Pod
             validator.only_subspec   = @only_subspec
             validator.use_frameworks = @use_frameworks
             validator.ignore_public_only_results = @private
+            validator.swift_version = @swift_version
+            validator.skip_import_validation = @skip_import_validation
+            validator.skip_tests = @skip_tests
             validator.validate
             failure_reasons << validator.failure_reason
 
@@ -91,15 +101,19 @@ module Pod
             @podspecs_paths << '.' if @podspecs_paths.empty?
             @podspecs_paths.each do |path|
               if path =~ %r{https?://}
-                require 'open-uri'
+                require 'cocoapods/open-uri'
                 output_path = podspecs_tmp_dir + File.basename(path)
                 output_path.dirname.mkpath
-                open(path) do |io|
-                  output_path.open('w') { |f| f << io.read }
+                begin
+                  open(path) do |io|
+                    output_path.open('w') { |f| f << io.read }
+                  end
+                rescue => e
+                  raise Informative, "Downloading a podspec from `#{path}` failed: #{e}"
                 end
                 files << output_path
               elsif (pathname = Pathname.new(path)).directory?
-                files += Pathname.glob(pathname + '**/*.podspec{.json,}')
+                files += Pathname.glob(pathname + '*.podspec{.json,}')
                 raise Informative, 'No specs found in the current directory.' if files.empty?
               else
                 files << (pathname = Pathname.new(path))

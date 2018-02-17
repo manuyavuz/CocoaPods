@@ -112,6 +112,15 @@ module Pod
         end
       end
 
+      it 'returns the working directory correctly when it includes unicode characters' do
+        unicode_directory = temporary_directory + "ü"
+        FileUtils.mkdir(unicode_directory)
+        Dir.chdir(unicode_directory) do
+          File.open('Podfile', 'w') {}
+          @config.installation_root.to_s.should == unicode_directory.to_s
+        end
+      end
+
       before do
         @config.installation_root = temporary_directory
       end
@@ -174,22 +183,6 @@ module Pod
 
       it 'does not print verbose information' do
         @config.should.not.be.verbose
-      end
-
-      it 'cleans SCM dirs in dependency checkouts' do
-        @config.should.clean
-      end
-
-      it 'locks pod source files' do
-        @config.should.lock_pod_source
-      end
-
-      it 'integrates a user target' do
-        @config.should.integrate_targets
-      end
-
-      it 'de-duplicates targets' do
-        @config.should.deduplicate_targets
       end
 
       it 'returns the cache root' do

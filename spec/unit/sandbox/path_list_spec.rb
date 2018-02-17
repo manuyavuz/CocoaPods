@@ -22,11 +22,23 @@ module Pod
           Classes/BananaLib.pch
           Classes/BananaPrivate.h
           Classes/BananaTrace.d
+          LICENSE
           README
+          Resources/Base.lproj/Main.storyboard
           Resources/Images.xcassets/Logo.imageset/Contents.json
           Resources/Images.xcassets/Logo.imageset/logo.png
+          Resources/Migration.xcmappingmodel/xcmapping.xml
+          Resources/Sample.xcdatamodeld/.xccurrentversion
+          Resources/Sample.xcdatamodeld/Sample\ 2.xcdatamodel/contents
+          Resources/Sample.xcdatamodeld/Sample.xcdatamodel/contents
+          Resources/de.lproj/logo-localized.png
+          Resources/en.lproj/Main.strings
+          Resources/en.lproj/logo-localized.png
+          Resources/en.lproj/nested/logo-nested.png
           Resources/logo-sidebar.png
           Resources/sub_dir/logo-sidebar.png
+          docs/guide1.md
+          docs/subdir/guide2.md
           framework/Source/MoreBanana.h
           libBananalib.a
           preserve_me.txt
@@ -51,9 +63,19 @@ module Pod
           Bananalib.framework/Versions/Current
           Classes
           Resources
+          Resources/Base.lproj
           Resources/Images.xcassets
           Resources/Images.xcassets/Logo.imageset
+          Resources/Migration.xcmappingmodel
+          Resources/Sample.xcdatamodeld
+          Resources/Sample.xcdatamodeld/Sample\ 2.xcdatamodel
+          Resources/Sample.xcdatamodeld/Sample.xcdatamodel
+          Resources/de.lproj
+          Resources/en.lproj
+          Resources/en.lproj/nested
           Resources/sub_dir
+          docs
+          docs/subdir
           framework
           framework/Source
           sub-dir
@@ -137,10 +159,38 @@ module Pod
       it 'can optionally include the directories in the results' do
         paths = @path_list.relative_glob('Resources/*', :include_dirs => true).map(&:to_s)
         paths.sort.should == %w(
+          Resources/Base.lproj
           Resources/Images.xcassets
+          Resources/Migration.xcmappingmodel
+          Resources/Sample.xcdatamodeld
+          Resources/de.lproj
+          Resources/en.lproj
           Resources/logo-sidebar.png
           Resources/sub_dir
         )
+      end
+    end
+
+    describe 'Reading file system' do
+      it 'orders paths case insensitively' do
+        root = fixture('banana-unordered')
+
+        # Let Find.find result be ordered case-sensitively
+        Find.stubs(:find).multiple_yields(
+          "#{root}/Classes",
+          "#{root}/Classes/NSFetchRequest+Banana.h",
+          "#{root}/Classes/NSFetchedResultsController+Banana.h",
+        )
+
+        path_list = Sandbox::PathList.new(root)
+        path_list.files.should == %w(Classes/NSFetchedResultsController+Banana.h Classes/NSFetchRequest+Banana.h)
+      end
+
+      it 'supports unicode paths' do
+        # Load fixture("ü") with chars ["u", "̈"] instead of ["ü"]
+        unicode_name = [117, 776].pack('U*')
+        path_list = Sandbox::PathList.new(fixture(unicode_name))
+        path_list.files.should == ['README']
       end
     end
 

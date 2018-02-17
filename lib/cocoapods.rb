@@ -40,6 +40,7 @@ module Pod
 
   autoload :AggregateTarget,           'cocoapods/target/aggregate_target'
   autoload :Command,                   'cocoapods/command'
+  autoload :Deintegrator,              'cocoapods_deintegrate'
   autoload :Executable,                'cocoapods/executable'
   autoload :ExternalSources,           'cocoapods/external_sources'
   autoload :Installer,                 'cocoapods/installer'
@@ -48,7 +49,6 @@ module Pod
   autoload :Project,                   'cocoapods/project'
   autoload :Resolver,                  'cocoapods/resolver'
   autoload :Sandbox,                   'cocoapods/sandbox'
-  autoload :SourcesManager,            'cocoapods/sources_manager'
   autoload :Target,                    'cocoapods/target'
   autoload :Validator,                 'cocoapods/validator'
 
@@ -66,5 +66,8 @@ module Pod
     autoload :PrefixHeader,            'cocoapods/generator/prefix_header'
     autoload :UmbrellaHeader,          'cocoapods/generator/umbrella_header'
     autoload :XCConfig,                'cocoapods/generator/xcconfig'
+    autoload :AppTargetHelper,         'cocoapods/generator/app_target_helper'
   end
+
+  require 'cocoapods/core_overrides'
 end

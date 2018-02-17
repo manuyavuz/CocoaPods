@@ -6,7 +6,7 @@ module Pod
       end
 
       def save_as(path)
-        Xcodeproj::PlistHelper.write(plist, path)
+        Xcodeproj::Plist.write_to_path(plist, path)
       end
 
       def plist
@@ -33,11 +33,14 @@ module Pod
 
       def hash_for_spec(spec)
         if (license = license_text(spec))
-          {
+          hash =  {
             :Type => 'PSGroupSpecifier',
             :Title => sanitize_encoding(spec.name),
             :FooterText => sanitize_encoding(license),
           }
+          hash[:License] = sanitize_encoding(spec.license[:type]) if spec.license[:type]
+
+          hash
         end
       end
 

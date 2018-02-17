@@ -12,10 +12,17 @@ module Pod
     it "complains if it can't find the repo" do
       Dir.chdir(fixture('banana-lib')) do
         cmd = command('repo', 'push', 'missing_repo')
-        cmd.expects(:check_if_master_repo)
-        cmd.expects(:validate_podspec_files).returns(true)
-        e = lambda { cmd.run }.should.raise Informative
-        e.message.should.match(/repo not found/)
+        e = lambda { cmd.validate! }.should.raise Informative
+        e.message.should.match(/Unable to find the `missing_repo` repo/)
+      end
+    end
+
+    it "complains if it can't get repo url" do
+      Dir.chdir(fixture('banana-lib')) do
+        Command::Repo::Add.any_instance.stubs(:clone_repo)
+        cmd = command('repo', 'push', 'https://github.com/foo/bar.git')
+        e = lambda { cmd.validate! }.should.raise Informative
+        e.message.should.include('Unable to find the `https://github.com/foo/bar.git` repo')
       end
     end
 
@@ -81,7 +88,7 @@ module Pod
       File.open(temporary_directory + 'BananaLib.podspec', 'w') { |f| f.write(spec_clean) }
     end
 
-    it 'refuses to push if the repo is not clean' do
+    it 'refuses to push if the repo is master' do
       Dir.chdir(test_repo_path) do
         `git remote set-url origin https://github.com/CocoaPods/Specs.git`
       end
@@ -101,7 +108,21 @@ module Pod
       (@upstream + 'PushTest/1.4/PushTest.podspec').should.not.exist?
     end
 
-    it 'successfully pushes a spec' do
+    it 'refuses to push if --no-overwrite is passed and the spec exists' do
+      cmd = command('repo', 'push', 'master', 'JSONKit.podspec', '--no-overwrite')
+      Dir.chdir(@upstream) { `git checkout -b tmp_for_push -q` }
+      cmd.expects(:validate_podspec_files).returns(true)
+
+      e = lambda { Dir.chdir(temporary_directory) { cmd.run } }.should.raise Pod::Informative
+      e.message.should == '[!] JSONKit (1.4) already exists and overwriting has been disabled.'
+
+      cmd = command('repo', 'push', 'master', 'PushTest.podspec', '--no-overwrite')
+      cmd.expects(:validate_podspec_files).returns(true)
+      Dir.chdir(temporary_directory) { cmd.run }
+      Pod::UI.output.should.include('[Add] PushTest (1.4)')
+    end
+
+    it 'generate a message for commit' do
       cmd = command('repo', 'push', 'master')
       Dir.chdir(@upstream) { `git checkout -b tmp_for_push -q` }
       cmd.expects(:validate_podspec_files).returns(true)
@@ -109,8 +130,33 @@ module Pod
       Pod::UI.output.should.include('[Add] PushTest (1.4)')
       Pod::UI.output.should.include('[Fix] JSONKit (1.4)')
       Pod::UI.output.should.include('[No change] BananaLib (1.0)')
+    end
+
+    it 'successfully pushes a spec' do
+      cmd = command('repo', 'push', 'master')
+      Dir.chdir(@upstream) { `git checkout -b tmp_for_push -q` }
+      cmd.expects(:validate_podspec_files).returns(true)
+      Dir.chdir(temporary_directory) { cmd.run }
       Dir.chdir(@upstream) { `git checkout master -q` }
       (@upstream + 'PushTest/1.4/PushTest.podspec').read.should.include('PushTest')
+    end
+
+    it 'successfully pushes a spec to URL' do
+      cmd = command('repo', 'push', @upstream)
+      Dir.chdir(@upstream) { `git checkout -b tmp_for_push -q` }
+      cmd.expects(:validate_podspec_files).returns(true)
+      Dir.chdir(temporary_directory) { cmd.run }
+      Dir.chdir(@upstream) { `git checkout master -q` }
+      (@upstream + 'PushTest/1.4/PushTest.podspec').read.should.include('PushTest')
+    end
+
+    it 'successfully pushes converted JSON podspec' do
+      cmd = command('repo', 'push', 'master', '--use-json')
+      Dir.chdir(@upstream) { `git checkout -b tmp_for_push -q` }
+      cmd.expects(:validate_podspec_files).returns(true)
+      Dir.chdir(temporary_directory) { cmd.run }
+      Dir.chdir(@upstream) { `git checkout master -q` }
+      (@upstream + 'PushTest/1.4/PushTest.podspec.json').read.should.include('PushTest')
     end
 
     it 'initializes with default sources if no custom sources specified' do
@@ -139,23 +185,39 @@ module Pod
     end
 
     it 'validates specs as frameworks by default' do
-      Validator.any_instance.expects(:podfile_from_spec).with(:ios, nil, true).times(3)
-      Validator.any_instance.expects(:podfile_from_spec).with(:osx, nil, true).twice
-      Validator.any_instance.expects(:podfile_from_spec).with(:watchos, nil, true).twice
-      Validator.any_instance.expects(:podfile_from_spec).with(:tvos, nil, true).twice
+      Validator.any_instance.expects(:podfile_from_spec).with(:ios, '8.0', true, []).times(3)
+      Validator.any_instance.expects(:podfile_from_spec).with(:osx, nil, true, []).twice
+      Validator.any_instance.expects(:podfile_from_spec).with(:watchos, nil, true, []).twice
+      Validator.any_instance.expects(:podfile_from_spec).with(:tvos, nil, true, []).twice
 
       cmd = command('repo', 'push', 'master')
-      Dir.chdir(temporary_directory) { cmd.run }
+      # Git push will throw an exception here since this is a local custom git repo. All we care is the validator
+      # tests so the exception is swallowed.
+      lambda do
+        Dir.chdir(temporary_directory) { cmd.run }
+      end.should.raise Informative
     end
 
     it 'validates specs as libraries if requested' do
-      Validator.any_instance.expects(:podfile_from_spec).with(:ios, nil, false).times(3)
-      Validator.any_instance.expects(:podfile_from_spec).with(:osx, nil, false).twice
-      Validator.any_instance.expects(:podfile_from_spec).with(:watchos, nil, false).twice
-      Validator.any_instance.expects(:podfile_from_spec).with(:tvos, nil, false).twice
+      Validator.any_instance.expects(:podfile_from_spec).with(:ios, nil, false, []).times(3)
+      Validator.any_instance.expects(:podfile_from_spec).with(:osx, nil, false, []).twice
+      Validator.any_instance.expects(:podfile_from_spec).with(:watchos, nil, false, []).twice
+      Validator.any_instance.expects(:podfile_from_spec).with(:tvos, nil, false, []).twice
 
       cmd = command('repo', 'push', 'master', '--use-libraries')
-      Dir.chdir(temporary_directory) { cmd.run }
+      # Git push will throw an exception here since this is a local custom git repo. All we care is the validator
+      # tests so the exception is swallowed.
+      lambda do
+        Dir.chdir(temporary_directory) { cmd.run }
+      end.should.raise Informative
+    end
+
+    it 'raises error and exit code when push fails' do
+      cmd = command('repo', 'push', 'master')
+      e = lambda do
+        Dir.chdir(temporary_directory) { cmd.run }
+      end.should.raise Informative
+      e.exit_status.should.equal(1)
     end
   end
 end

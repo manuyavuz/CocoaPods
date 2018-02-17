@@ -5,11 +5,16 @@ module Pod
     #
     class Analyzer
       include Config::Mixin
+      include InstallationOptions::Mixin
+
+      delegate_installation_options { podfile }
 
       autoload :AnalysisResult,            'cocoapods/installer/analyzer/analysis_result'
       autoload :SandboxAnalyzer,           'cocoapods/installer/analyzer/sandbox_analyzer'
       autoload :SpecsState,                'cocoapods/installer/analyzer/specs_state'
       autoload :LockingDependencyAnalyzer, 'cocoapods/installer/analyzer/locking_dependency_analyzer'
+      autoload :PodVariant,                'cocoapods/installer/analyzer/pod_variant'
+      autoload :PodVariantSet,             'cocoapods/installer/analyzer/pod_variant_set'
       autoload :TargetInspectionResult,    'cocoapods/installer/analyzer/target_inspection_result'
       autoload :TargetInspector,           'cocoapods/installer/analyzer/target_inspector'
 
@@ -27,19 +32,28 @@ module Pod
       #
       attr_reader :lockfile
 
+      # @return [Array<Source>] Sources provided by plugins
+      #
+      attr_reader :plugin_sources
+
       # Initialize a new instance
       #
-      # @param  [Sandbox]  sandbox     @see sandbox
-      # @param  [Podfile]  podfile     @see podfile
-      # @param  [Lockfile] lockfile    @see lockfile
+      # @param  [Sandbox]       sandbox           @see sandbox
+      # @param  [Podfile]       podfile           @see podfile
+      # @param  [Lockfile]      lockfile          @see lockfile
+      # @param  [Array<Source>] plugin_sources    @see plugin_sources
       #
-      def initialize(sandbox, podfile, lockfile = nil)
+      def initialize(sandbox, podfile, lockfile = nil, plugin_sources = nil)
         @sandbox  = sandbox
         @podfile  = podfile
         @lockfile = lockfile
+        @plugin_sources = plugin_sources
 
         @update = false
         @allow_pre_downloads = true
+        @has_dependencies = true
+        @test_pod_target_analyzer_cache = {}
+        @test_pod_target_key = Struct.new(:name, :pod_targets)
       end
 
       # Performs the analysis.
@@ -57,20 +71,27 @@ module Pod
         validate_podfile!
         validate_lockfile_version!
         @result = AnalysisResult.new
-        if config.integrate_targets?
+        if installation_options.integrate_targets?
           @result.target_inspections = inspect_targets_to_integrate
         else
           verify_platforms_specified!
         end
         @result.podfile_state = generate_podfile_state
-        @locked_dependencies  = generate_version_locking_dependencies
 
         store_existing_checkout_options
         fetch_external_sources if allow_fetches
-        @result.specs_by_target = validate_platforms(resolve_dependencies)
-        @result.specifications  = generate_specifications
-        @result.targets         = generate_targets
+
+        @locked_dependencies = generate_version_locking_dependencies
+        resolver_specs_by_target = resolve_dependencies
+        validate_platforms(resolver_specs_by_target)
+        @result.specifications  = generate_specifications(resolver_specs_by_target)
+        @result.targets         = generate_targets(resolver_specs_by_target)
         @result.sandbox_state   = generate_sandbox_state
+        @result.specs_by_target = resolver_specs_by_target.each_with_object({}) do |rspecs_by_target, hash|
+          hash[rspecs_by_target[0]] = rspecs_by_target[1].map(&:spec)
+        end
+        @result.specs_by_source = Hash[resolver_specs_by_target.values.flatten(1).group_by(&:source).map { |source, specs| [source, specs.map(&:spec).uniq] }]
+        sources.each { |s| @result.specs_by_source[s] ||= [] }
         @result
       end
 
@@ -146,9 +167,23 @@ module Pod
       attr_accessor :allow_pre_downloads
       alias_method :allow_pre_downloads?, :allow_pre_downloads
 
+      # @return [Bool] Whether the analysis has dependencies and thus
+      #         sources must be configured.
+      #
+      # @note   This is used by the `pod lib lint` command to prevent
+      #         update of specs when not needed.
+      #
+      attr_accessor :has_dependencies
+      alias_method :has_dependencies?, :has_dependencies
+
       #-----------------------------------------------------------------------#
 
       private
+
+      # @return [Bool] Whether the analysis has updated sources repositories.
+      #
+      attr_accessor :specs_updated
+      alias_method :specs_updated?, :specs_updated
 
       def validate_podfile!
         validator = Installer::PodfileValidator.new(podfile)
@@ -157,6 +192,7 @@ module Pod
         unless validator.valid?
           raise Informative, validator.message
         end
+        validator.warnings.uniq.each { |w| UI.warn(w) }
       end
 
       # @!group Analysis steps
@@ -198,35 +234,183 @@ module Pod
           pods_state
         else
           state = SpecsState.new
-          state.added.concat(podfile.dependencies.map(&:name).uniq)
+          state.added.merge(podfile.dependencies.map(&:root_name))
           state
         end
       end
 
       public
 
-      # Updates the git source repositories unless the config indicates to skip it.
+      # Updates the git source repositories.
       #
       def update_repositories
         sources.each do |source|
-          if SourcesManager.git_repo?(source.repo)
-            SourcesManager.update(source.name)
+          if source.git?
+            config.sources_manager.update(source.name, true)
           else
             UI.message "Skipping `#{source.name}` update because the repository is not a git source repository."
           end
         end
+        @specs_updated = true
       end
 
       private
 
+      # Copies the pod_targets of any of the app embedded aggregate targets into
+      # their potential host aggregate target, if that potential host aggregate target's
+      # user_target hosts any of the app embedded aggregate targets' user_targets
+      #
+      # @param  [AggregateTarget] aggregate_target the aggregate target whose user_target
+      #         might host one or more of the embedded aggregate targets' user_targets
+      #
+      # @param  [Array<AggregateTarget>] embedded_aggregate_targets the aggregate targets
+      #         representing the embedded targets to be integrated
+      #
+      # @param  [Boolean] libraries_only if true, only library-type embedded
+      #         targets are considered, otherwise, all other types are have
+      #         their pods copied to their host targets as well (extensions, etc.)
+      #
+      def copy_embedded_target_pod_targets_to_host(aggregate_target, embedded_aggregate_targets, libraries_only)
+        return if aggregate_target.requires_host_target?
+        pod_target_names = Set.new(aggregate_target.pod_targets.map(&:name))
+        aggregate_user_target_uuids = Set.new(aggregate_target.user_targets.map(&:uuid))
+        embedded_aggregate_targets.each do |embedded_aggregate_target|
+          # Skip non libraries in library-only mode
+          next if libraries_only && !embedded_aggregate_target.library?
+          next unless embedded_aggregate_target.user_targets.any? do |embedded_user_target|
+            # You have to ask the host target's project for the host targets of
+            # the embedded target, as opposed to asking user_project for the
+            # embedded targets of the host target. The latter doesn't work when
+            # the embedded target lives in a sub-project. The lines below get
+            # the host target uuids for the embedded target and checks to see if
+            # those match to any of the user_target uuids in the aggregate_target.
+            host_target_uuids = Set.new(aggregate_target.user_project.host_targets_for_embedded_target(embedded_user_target).map(&:uuid))
+            !aggregate_user_target_uuids.intersection(host_target_uuids).empty?
+          end
+          # This embedded target is hosted by the aggregate target's user_target; copy over the non-duplicate pod_targets
+          aggregate_target.pod_targets = aggregate_target.pod_targets + embedded_aggregate_target.pod_targets.select do |pod_target|
+            !pod_target_names.include? pod_target.name
+          end
+        end
+      end
+
+      # Raises an error if there are embedded targets in the Podfile, but
+      # their host targets have not been declared in the Podfile. As it
+      # finds host targets, it collection information on host target types.
+      #
+      # @param  [Array<AggregateTarget>] aggregate_targets the generated
+      #         aggregate targets
+      #
+      # @param  [Array<AggregateTarget>] embedded_aggregate_targets the aggregate targets
+      #         representing the embedded targets to be integrated
+      #
+      def analyze_host_targets_in_podfile(aggregate_targets, embedded_aggregate_targets)
+        target_definitions_by_uuid = {}
+        # Collect aggregate target definitions by uuid to later lookup host target
+        # definitions and verify their compatiblity with their embedded targets
+        aggregate_targets.each do |target|
+          target.user_targets.map(&:uuid).each do |uuid|
+            target_definitions_by_uuid[uuid] = target.target_definition
+          end
+        end
+        aggregate_target_user_projects = aggregate_targets.map(&:user_project)
+        embedded_targets_missing_hosts = []
+        host_uuid_to_embedded_target_definitions = {}
+        # Search all of the known user projects for each embedded target's hosts
+        embedded_aggregate_targets.each do |target|
+          host_uuids = []
+          aggregate_target_user_projects.product(target.user_targets).each do |user_project, user_target|
+            host_uuids += user_project.host_targets_for_embedded_target(user_target).map(&:uuid)
+          end
+          # For each host, keep track of its embedded target definitions
+          # to later verify each embedded target's compatiblity with its host,
+          # ignoring the hosts that aren't known to CocoaPods (no target
+          # definitions in the Podfile)
+          host_uuids.each do |uuid|
+            (host_uuid_to_embedded_target_definitions[uuid] ||= []) << target.target_definition if target_definitions_by_uuid.key? uuid
+          end
+          # If none of the hosts are known to CocoaPods (no target definitions
+          # in the Podfile), add it to the list of targets missing hosts
+          embedded_targets_missing_hosts << target unless host_uuids.any? do |uuid|
+            target_definitions_by_uuid.key? uuid
+          end
+        end
+
+        unless embedded_targets_missing_hosts.empty?
+          embedded_targets_missing_hosts_product_types = Set.new embedded_targets_missing_hosts.map(&:user_targets).flatten.map(&:symbol_type)
+          target_names = embedded_targets_missing_hosts.map do |target|
+            target.name.sub('Pods-', '') # Make the target names more recognizable to the user
+          end.join ', '
+          #  If the targets missing hosts are only frameworks, then this is likely
+          #  a project for doing framework development. In that case, just warn that
+          #  the frameworks that these targets depend on won't be integrated anywhere
+          if embedded_targets_missing_hosts_product_types.subset?(Set.new([:framework, :static_library]))
+            UI.warn "The Podfile contains framework or static library targets (#{target_names}), for which the Podfile does not contain host targets (targets which embed the framework)." \
+              "\n" \
+              'If this project is for doing framework development, you can ignore this message. Otherwise, add a target to the Podfile that embeds these frameworks to make this message go away (e.g. a test target).'
+          else
+            raise Informative, "Unable to find host target(s) for #{target_names}. Please add the host targets for the embedded targets to the Podfile." \
+                                "\n" \
+                                'Certain kinds of targets require a host target. A host target is a "parent" target which embeds a "child" target. These are example types of targets that need a host target:' \
+                                "\n- Framework" \
+                                "\n- App Extension" \
+                                "\n- Watch OS 1 Extension" \
+                                "\n- Messages Extension (except when used with a Messages Application)"
+          end
+        end
+
+        target_mismatches = []
+        host_uuid_to_embedded_target_definitions.each do |uuid, target_definitions|
+          host_target_definition = target_definitions_by_uuid[uuid]
+          target_definitions.each do |target_definition|
+            unless host_target_definition.uses_frameworks? == target_definition.uses_frameworks?
+              target_mismatches << "- #{host_target_definition.name} (#{host_target_definition.uses_frameworks?}) and #{target_definition.name} (#{target_definition.uses_frameworks?}) do not both set use_frameworks!."
+            end
+          end
+        end
+
+        unless target_mismatches.empty?
+          heading = 'Unable to integrate the following embedded targets with their respective host targets (a host target is a "parent" target which embeds a "child" target like a framework or extension):'
+          raise Informative, heading + "\n\n" + target_mismatches.sort.uniq.join("\n")
+        end
+      end
+
       # Creates the models that represent the targets generated by CocoaPods.
       #
-      # @return [Array<AggregateTarget>]
+      # @param  [Hash{Podfile::TargetDefinition => Array<ResolvedSpecification>}] resolver_specs_by_target
+      #         mapping of targets to resolved specs (containing information about test usage)
+      #         aggregate targets
       #
-      def generate_targets
-        pod_targets = generate_pod_targets(result.specs_by_target)
-        result.specs_by_target.map do |target_definition, _|
-          generate_target(target_definition, pod_targets)
+      # @return [Array<AggregateTarget>] the list of aggregate targets generated.
+      #
+      def generate_targets(resolver_specs_by_target)
+        resolver_specs_by_target = resolver_specs_by_target.reject { |td, _| td.abstract? }
+        pod_targets = generate_pod_targets(resolver_specs_by_target)
+        aggregate_targets = resolver_specs_by_target.keys.map do |target_definition|
+          generate_target(target_definition, pod_targets, resolver_specs_by_target)
+        end
+        if installation_options.integrate_targets?
+          # Copy embedded target pods that cannot have their pods embedded as frameworks to
+          # their host targets, and ensure we properly link library pods to their host targets
+          embedded_targets = aggregate_targets.select(&:requires_host_target?)
+          analyze_host_targets_in_podfile(aggregate_targets, embedded_targets)
+
+          use_frameworks_embedded_targets = embedded_targets.select(&:requires_frameworks?)
+          non_use_frameworks_embedded_targets = embedded_targets.reject(&:requires_frameworks?)
+          aggregate_targets.each do |target|
+            # For targets that require frameworks, we always have to copy their pods to their
+            # host targets because those frameworks will all be loaded from the host target's bundle
+            copy_embedded_target_pod_targets_to_host(target, use_frameworks_embedded_targets, false)
+
+            # For targets that don't require frameworks, we only have to consider library-type
+            # targets because their host targets will still need to link their pods
+            copy_embedded_target_pod_targets_to_host(target, non_use_frameworks_embedded_targets, true)
+          end
+        end
+        aggregate_targets.each do |target|
+          target.search_paths_aggregate_targets = aggregate_targets.select do |aggregate_target|
+            target.target_definition.targets_to_inherit_search_paths.include?(aggregate_target.target_definition)
+          end
         end
       end
 
@@ -238,14 +422,18 @@ module Pod
       # @param  [Array<PodTarget>] pod_targets
       #         the pod targets, which were generated.
       #
+      # @param  [Hash{Podfile::TargetDefinition => Array<ResolvedSpecification>}] resolver_specs_by_target
+      #         the resolved specifications grouped by target.
+      #
       # @return [AggregateTarget]
       #
-      def generate_target(target_definition, pod_targets)
+      def generate_target(target_definition, pod_targets, resolver_specs_by_target)
         target = AggregateTarget.new(target_definition, sandbox)
         target.host_requires_frameworks |= target_definition.uses_frameworks?
 
-        if config.integrate_targets?
+        if installation_options.integrate_targets?
           target_inspection = result.target_inspections[target_definition]
+          raise "missing inspection: #{target_definition.name}" unless target_inspection
           target.user_project = target_inspection.project
           target.client_root = target.user_project_path.dirname.realpath
           target.user_target_uuids = target_inspection.project_target_uuids
@@ -260,102 +448,142 @@ module Pod
           end
         end
 
-        target.pod_targets = pod_targets.select do |pod_target|
-          pod_target.target_definitions.include?(target_definition)
-        end
+        target.pod_targets = filter_pod_targets_for_target_definition(target_definition, pod_targets, resolver_specs_by_target)
+
         target
       end
 
+      # Returns a filtered list of pod targets that should or should not be part of the target definition. Pod targets
+      # used by tests only are filtered.
+      #
+      # @param [TargetDefinition] target_definition
+      #        the target definition to use as the base for filtering
+      #
+      # @param [Array<PodTarget>] pod_targets
+      #        the array of pod targets to check against
+      #
+      # @param  [Hash{Podfile::TargetDefinition => Array<ResolvedSpecification>}] resolver_specs_by_target
+      #         the resolved specifications grouped by target.
+      #
+      # @return [Array<PodTarget>] the filtered list of pod targets.
+      #
+      def filter_pod_targets_for_target_definition(target_definition, pod_targets, resolver_specs_by_target)
+        pod_targets.select do |pod_target|
+          included_in_target_definition = pod_target.target_definitions.include?(target_definition)
+          used_by_tests_only = resolver_specs_by_target[target_definition].select { |resolver_spec| pod_target.specs.include?(resolver_spec.spec) }.all?(&:used_by_tests_only?)
+          included_in_target_definition && !used_by_tests_only
+        end
+      end
+
       # Setup the pod targets for an aggregate target. Deduplicates resulting
-      # targets by grouping by grouping by platform and subspec by their root
+      # targets by grouping by platform and subspec by their root
       # to create a {PodTarget} for each spec.
       #
-      # @param  [Hash{Podfile::TargetDefinition => Array<Specification>}] specs_by_target
+      # @param  [Hash{Podfile::TargetDefinition => Array<ResolvedSpecification>}] resolver_specs_by_target
       #         the resolved specifications grouped by target.
       #
       # @return [Array<PodTarget>]
       #
-      def generate_pod_targets(specs_by_target)
-        if config.deduplicate_targets?
-          dedupe_cache = {}
-
-          all_specs = specs_by_target.flat_map do |target_definition, dependent_specs|
-            dependent_specs.group_by(&:root).map do |root_spec, specs|
-              [root_spec, specs, target_definition]
+      def generate_pod_targets(resolver_specs_by_target)
+        if installation_options.deduplicate_targets?
+          distinct_targets = resolver_specs_by_target.each_with_object({}) do |dependency, hash|
+            target_definition, dependent_specs = *dependency
+            dependent_specs.group_by(&:root).each do |root_spec, resolver_specs|
+              all_specs = resolver_specs.map(&:spec)
+              test_specs, specs = all_specs.partition(&:test_specification?)
+              pod_variant = PodVariant.new(specs, test_specs, target_definition.platform, target_definition.uses_frameworks?)
+              hash[root_spec] ||= {}
+              (hash[root_spec][pod_variant] ||= []) << target_definition
+              hash[root_spec].keys.find { |k| k == pod_variant }.test_specs.concat(test_specs).uniq!
             end
           end
 
-          distinct_targets = all_specs.each_with_object({}) do |dependency, hash|
-            root_spec, specs, target_definition = *dependency
-            hash[root_spec] ||= {}
-            (hash[root_spec][[specs, target_definition.platform]] ||= []) << target_definition
-          end
-
-          pod_targets = distinct_targets.flat_map do |_, targets_by_distinctors|
-            if targets_by_distinctors.count > 1
-              # There are different sets of subspecs or the spec is used across different platforms
-              targets_by_distinctors.flat_map do |distinctor, target_definitions|
-                specs, = *distinctor
-                generate_pod_target(target_definitions, specs).scoped(dedupe_cache)
-              end
-            else
-              (specs, _), target_definitions = targets_by_distinctors.first
-              generate_pod_target(target_definitions, specs)
+          pod_targets = distinct_targets.flat_map do |_root, target_definitions_by_variant|
+            suffixes = PodVariantSet.new(target_definitions_by_variant.keys).scope_suffixes
+            target_definitions_by_variant.flat_map do |variant, target_definitions|
+              generate_pod_target(target_definitions, variant.specs + variant.test_specs, :scope_suffix => suffixes[variant])
             end
           end
 
-          # A `PodTarget` can't be deduplicated if any of its
-          # transitive dependencies can't be deduplicated.
-          pod_targets.flat_map do |target|
-            dependent_targets = transitive_dependencies_for_pod_target(target, pod_targets)
-            target.dependent_targets = dependent_targets
-            if dependent_targets.any?(&:scoped?)
-              target.scoped(dedupe_cache)
-            else
-              target
-            end
-          end
-        else
-          pod_targets = specs_by_target.flat_map do |target_definition, specs|
-            grouped_specs = specs.group_by.group_by(&:root).values.uniq
-            grouped_specs.flat_map do |pod_specs|
-              generate_pod_target([target_definition], pod_specs).scoped(dedupe_cache)
-            end
+          all_resolver_specs = resolver_specs_by_target.values.flatten.map(&:spec).uniq
+          pod_targets_by_name = pod_targets.group_by(&:pod_name).each_with_object({}) do |(name, values), hash|
+            # Sort the target by the number of activated subspecs, so that
+            # we prefer a minimal target as transitive dependency.
+            hash[name] = values.sort_by { |pt| pt.specs.count }
           end
           pod_targets.each do |target|
-            target.dependent_targets = transitive_dependencies_for_pod_target(target, pod_targets)
+            all_specs = all_resolver_specs.to_set
+            dependencies = transitive_dependencies_for_specs(target.non_test_specs.to_set, target.platform, all_specs).group_by(&:root)
+            test_dependencies = transitive_dependencies_for_specs(target.test_specs.to_set, target.platform, all_specs).group_by(&:root)
+            test_dependencies.delete_if { |k| dependencies.key? k }
+            target.dependent_targets = filter_dependencies(dependencies, pod_targets_by_name, target)
+            target.test_dependent_targets = filter_dependencies(test_dependencies, pod_targets_by_name, target)
+          end
+        else
+          dedupe_cache = {}
+          resolver_specs_by_target.flat_map do |target_definition, specs|
+            grouped_specs = specs.group_by(&:root).values.uniq
+            pod_targets = grouped_specs.flat_map do |pod_specs|
+              generate_pod_target([target_definition], pod_specs.map(&:spec)).scoped(dedupe_cache)
+            end
+
+            pod_targets.each do |target|
+              all_specs = specs.map(&:spec).to_set
+              dependencies = transitive_dependencies_for_specs(target.non_test_specs.to_set, target.platform, all_specs).group_by(&:root)
+              test_dependencies = transitive_dependencies_for_specs(target.test_specs.to_set, target.platform, all_specs).group_by(&:root)
+              test_dependencies.delete_if { |k| dependencies.key? k }
+              target.dependent_targets = pod_targets.reject { |t| dependencies[t.root_spec].nil? }
+              target.test_dependent_targets = pod_targets.reject { |t| test_dependencies[t.root_spec].nil? }
+            end
           end
         end
       end
 
-      # Finds the names of the Pods upon which the given target _transitively_
-      # depends.
+      def filter_dependencies(dependencies, pod_targets_by_name, target)
+        dependencies.map do |root_spec, deps|
+          pod_targets_by_name[root_spec.name].find do |t|
+            next false if t.platform.symbolic_name != target.platform.symbolic_name ||
+                t.requires_frameworks? != target.requires_frameworks?
+            spec_names = t.specs.map(&:name)
+            deps.all? { |dep| spec_names.include?(dep.name) }
+          end
+        end
+      end
+
+      # Returns the specs upon which the given specs _transitively_ depend.
       #
       # @note: This is implemented in the analyzer, because we don't have to
       #        care about the requirements after dependency resolution.
       #
-      # @param  [PodTarget] pod_target
-      #         The pod target, whose dependencies should be returned.
+      # @param  [Array<Specification>] specs
+      #         The specs, whose dependencies should be returned.
       #
-      # @param  [Array<PodTarget>] targets
-      #         All pod targets, which are integrated alongside.
+      # @param  [Platform] platform
+      #         The platform for which the dependencies should be returned.
       #
-      # @return [Array<PodTarget>]
+      # @param  [Array<Specification>] all_specs
+      #         All specifications which are installed alongside.
       #
-      def transitive_dependencies_for_pod_target(pod_target, targets)
-        if targets.any?
-          dependent_targets = pod_target.dependencies.flat_map do |dep|
-            next [] if pod_target.pod_name == dep
-            targets.select { |t| t.pod_name == dep }
+      # @return [Array<Specification>]
+      #
+      def transitive_dependencies_for_specs(specs, platform, all_specs)
+        return [] if specs.empty? || all_specs.empty?
+
+        dependent_specs = Set.new
+        specs.each do |spec|
+          spec.consumer(platform).dependencies.each do |dependency|
+            match = all_specs.find do |s|
+              next false unless s.name == dependency.name
+              next false if specs.include?(s)
+              true
+            end
+            dependent_specs << match if match
           end
-          remaining_targets = targets - dependent_targets
-          dependent_targets += dependent_targets.flat_map do |target|
-            transitive_dependencies_for_pod_target(target, remaining_targets)
-          end
-          dependent_targets.uniq
-        else
-          []
         end
+
+        remaining_specs = all_specs - dependent_specs
+
+        dependent_specs.union transitive_dependencies_for_specs(dependent_specs, platform, remaining_specs)
       end
 
       # Create a target for each spec group
@@ -363,15 +591,19 @@ module Pod
       # @param  [TargetDefinitions] target_definitions
       #         the aggregate target
       #
-      # @param  [Array<Specification>] specs
+      # @param  [Array<Specification>] pod_specs
       #         the specifications of an equal root.
+      #
+      # @param  [String] scope_suffix
+      #         @see PodTarget#scope_suffix
       #
       # @return [PodTarget]
       #
-      def generate_pod_target(target_definitions, pod_specs)
-        pod_target = PodTarget.new(pod_specs, target_definitions, sandbox)
+      def generate_pod_target(target_definitions, pod_specs, scope_suffix: nil)
+        pod_target = PodTarget.new(pod_specs, target_definitions, sandbox, scope_suffix)
+        pod_target.host_requires_frameworks = target_definitions.any?(&:uses_frameworks?)
 
-        if config.integrate_targets?
+        if installation_options.integrate_targets?
           target_inspections = result.target_inspections.select { |t, _| target_definitions.include?(t) }.values
           pod_target.user_build_configurations = target_inspections.map(&:build_configurations).reduce({}, &:merge)
           pod_target.archs = target_inspections.flat_map(&:archs).compact.uniq.sort
@@ -402,8 +634,11 @@ module Pod
         else
           pods_to_update = result.podfile_state.changed + result.podfile_state.deleted
           pods_to_update += update[:pods] if update_mode == :selected
-          pods_to_update += podfile.dependencies.select(&:local?).map(&:name)
-          LockingDependencyAnalyzer.generate_version_locking_dependencies(lockfile, pods_to_update)
+          local_pod_names = podfile.dependencies.select(&:local?).map(&:root_name)
+          pods_to_unlock = local_pod_names.reject do |pod_name|
+            sandbox.specification(pod_name).checksum == lockfile.checksum(pod_name)
+          end
+          LockingDependencyAnalyzer.generate_version_locking_dependencies(lockfile, pods_to_update, pods_to_unlock)
         end
       end
 
@@ -433,7 +668,7 @@ module Pod
         unless dependencies_to_fetch.empty?
           UI.section 'Fetching external sources' do
             dependencies_to_fetch.sort.each do |dependency|
-              fetch_external_source(dependency, !pods_to_fetch.include?(dependency.name))
+              fetch_external_source(dependency, !pods_to_fetch.include?(dependency.root_name))
             end
           end
         end
@@ -451,11 +686,12 @@ module Pod
 
       def fetch_external_source(dependency, use_lockfile_options)
         checkout_options = lockfile.checkout_options_for_pod_named(dependency.root_name) if lockfile
-        if checkout_options && use_lockfile_options
-          source = ExternalSources.from_params(checkout_options, dependency, podfile.defined_in_file)
-        else
-          source = ExternalSources.from_dependency(dependency, podfile.defined_in_file)
+        source = if checkout_options && use_lockfile_options
+                   ExternalSources.from_params(checkout_options, dependency, podfile.defined_in_file)
+                 else
+                   ExternalSources.from_dependency(dependency, podfile.defined_in_file)
         end
+        source.can_cache = installation_options.clean?
         source.fetch(sandbox)
       end
 
@@ -467,11 +703,10 @@ module Pod
           if update_mode == :all
             deps_to_fetch = deps_with_external_source
           else
-            deps_to_fetch = deps_with_external_source.select { |dep| pods_to_fetch.include?(dep.name) }
-            deps_to_fetch_if_needed = deps_with_external_source.select { |dep| result.podfile_state.unchanged.include?(dep.name) }
+            deps_to_fetch = deps_with_external_source.select { |dep| pods_to_fetch.include?(dep.root_name) }
+            deps_to_fetch_if_needed = deps_with_external_source.select { |dep| result.podfile_state.unchanged.include?(dep.root_name) }
             deps_to_fetch += deps_to_fetch_if_needed.select do |dep|
-              sandbox.specification(dep.name).nil? ||
-                !dep.external_source[:local].nil? ||
+              sandbox.specification(dep.root_name).nil? ||
                 !dep.external_source[:path].nil? ||
                 !sandbox.pod_dir(dep.root_name).directory? ||
                 checkout_requires_update?(dep)
@@ -496,6 +731,9 @@ module Pod
           elsif update_mode == :all
             pods_to_fetch += result.podfile_state.unchanged + result.podfile_state.deleted
           end
+          pods_to_fetch += podfile.dependencies.
+            select { |dep| Hash(dep.external_source).key?(:podspec) && sandbox.specification_path(dep.root_name).nil? }.
+            map(&:root_name)
           pods_to_fetch
         end
       end
@@ -535,27 +773,29 @@ module Pod
            "- #{dependencies.map(&:to_s).join("\n- ")}"
         end
 
-        specs_by_target = nil
+        resolver_specs_by_target = nil
         UI.section "Resolving dependencies of #{UI.path(podfile.defined_in_file) || 'Podfile'}" do
           resolver = Resolver.new(sandbox, podfile, locked_dependencies, sources)
-          specs_by_target = resolver.resolve
-          specs_by_target.values.flatten(1).each(&:validate_cocoapods_version)
+          resolver.specs_updated = specs_updated?
+          resolver_specs_by_target = resolver.resolve
+          resolver_specs_by_target.values.flatten(1).map(&:spec).each(&:validate_cocoapods_version)
         end
-        specs_by_target
+        resolver_specs_by_target
       end
 
       # Warns for any specification that is incompatible with its target.
       #
-      # @param  [Hash{TargetDefinition => Array<Spec>}] specs_by_target
+      # @param  [Hash{TargetDefinition => Array<Spec>}] resolver_specs_by_target
       #         the specifications grouped by target.
       #
       # @return [Hash{TargetDefinition => Array<Spec>}] the specifications
       #         grouped by target.
       #
-      def validate_platforms(specs_by_target)
-        specs_by_target.each do |target, specs|
-          specs.each do |spec|
-            unless spec.available_platforms.any? { |p| target.platform.supports?(p) }
+      def validate_platforms(resolver_specs_by_target)
+        resolver_specs_by_target.each do |target, specs|
+          specs.map(&:spec).each do |spec|
+            next unless target_platform = target.platform
+            unless spec.available_platforms.any? { |p| target_platform.supports?(p) }
               UI.warn "The platform of the target `#{target.name}` "     \
                 "(#{target.platform}) may not be compatible with `#{spec}` which has "  \
                 "a minimum requirement of #{spec.available_platforms.join(' - ')}."
@@ -564,12 +804,12 @@ module Pod
         end
       end
 
-      # Returns the list of all the resolved the resolved specifications.
+      # Returns the list of all the resolved specifications.
       #
       # @return [Array<Specification>] the list of the specifications.
       #
-      def generate_specifications
-        result.specs_by_target.values.flatten.uniq
+      def generate_specifications(resolver_specs_by_target)
+        resolver_specs_by_target.values.flatten.map(&:spec).uniq
       end
 
       # Computes the state of the sandbox respect to the resolved
@@ -604,9 +844,9 @@ module Pod
 
       # Returns the sources used to query for specifications
       #
-      # When no explicit Podfile sources are defined, this defaults to the
-      # master spec repository.
-      # available sources ({SourcesManager.all}).
+      # When no explicit Podfile sources or plugin sources are defined, this
+      # defaults to the master spec repository.
+      # available sources ({config.sources_manager.all}).
       #
       # @return [Array<Source>] the sources to be used in finding
       #         specifications, as specified by the {#podfile} or all sources.
@@ -614,14 +854,27 @@ module Pod
       def sources
         @sources ||= begin
           sources = podfile.sources
-          if sources.empty?
-            url = 'https://github.com/CocoaPods/Specs.git'
-            [SourcesManager.find_or_create_source_with_url(url)]
+          plugin_sources = @plugin_sources || []
+
+          # Add any sources specified using the :source flag on individual dependencies.
+          dependency_sources = podfile.dependencies.map(&:podspec_repo).compact
+          all_dependencies_have_sources = dependency_sources.count == podfile.dependencies.count
+
+          if all_dependencies_have_sources
+            sources = dependency_sources
+          elsif has_dependencies? && sources.empty? && plugin_sources.empty?
+            sources = ['https://github.com/CocoaPods/Specs.git']
           else
-            sources.map do |source_url|
-              SourcesManager.find_or_create_source_with_url(source_url)
-            end
+            sources += dependency_sources
           end
+
+          result = sources.uniq.map do |source_url|
+            config.sources_manager.find_or_create_source_with_url(source_url)
+          end
+          unless plugin_sources.empty?
+            result.insert(0, *plugin_sources)
+          end
+          result
         end
       end
 
@@ -636,7 +889,7 @@ module Pod
       # @return [void]
       #
       def verify_platforms_specified!
-        unless config.integrate_targets?
+        unless installation_options.integrate_targets?
           podfile.target_definition_list.each do |target_definition|
             if !target_definition.empty? && target_definition.platform.nil?
               raise Informative, 'It is necessary to specify the platform in the Podfile if not integrating.'
@@ -657,8 +910,9 @@ module Pod
         inspection_result = {}
         UI.section 'Inspecting targets to integrate' do
           inspectors = podfile.target_definition_list.map do |target_definition|
+            next if target_definition.abstract?
             TargetInspector.new(target_definition, config.installation_root)
-          end
+          end.compact
           inspectors.group_by(&:compute_project_path).each do |project_path, target_inspectors|
             project = Xcodeproj::Project.open(project_path)
             target_inspectors.each do |inspector|

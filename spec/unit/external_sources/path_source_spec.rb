@@ -15,16 +15,6 @@ module Pod
       path.should.exist?
     end
 
-    it 'supports the deprecated local key' do
-      params = { :local => fixture('integration/Reachability') }
-      dependency = Dependency.new('Reachability', params)
-      podfile_path = fixture('integration/Podfile')
-      @subject = ExternalSources.from_dependency(dependency, podfile_path)
-      @subject.fetch(config.sandbox)
-      path = config.sandbox.specifications_root + 'Reachability.podspec.json'
-      path.should.exist?
-    end
-
     it 'returns the description' do
       @subject.description.should.match /from `.*integration\/Reachability`/
     end
@@ -32,7 +22,7 @@ module Pod
     it 'marks the Pod as local in the sandbox' do
       @subject.fetch(config.sandbox)
       config.sandbox.development_pods.should == {
-        'Reachability' => fixture('integration/Reachability').to_s,
+        'Reachability' => fixture('integration/Reachability/Reachability.podspec'),
       }
     end
 

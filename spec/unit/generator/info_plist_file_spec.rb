@@ -1,65 +1,103 @@
 require File.expand_path('../../../spec_helper', __FILE__)
 
-describe Pod::Generator::InfoPlistFile do
-  describe '#target_version' do
-    it 'returns 1.0.0 for the aggregate target' do
-      generator = Pod::Generator::InfoPlistFile.new(fixture_aggregate_target)
-      generator.target_version.should == '1.0.0'
+module Pod
+  describe Generator::InfoPlistFile do
+    it 'replaces the version in the generated plist' do
+      generator = Generator::InfoPlistFile.new('0.1.0', Platform.new(:ios, '6.0'))
+      generator.generate.should.include "<key>CFBundleShortVersionString</key>\n  <string>0.1.0</string>"
     end
 
-    describe 'sanitization' do
-      before do
-        @root_spec = mock('RootSpec')
-        pod_target = stub('PodTarget', :root_spec => @root_spec)
-        @generator = Pod::Generator::InfoPlistFile.new(pod_target)
+    it 'generates a valid Info.plist file' do
+      generator = Generator::InfoPlistFile.new('1.0.0', Platform.new(:ios, '6.0'))
+      file = temporary_directory + 'Info.plist'
+      generator.save_as(file)
+      `plutil -lint #{file}`
+      $?.should.be.success
+    end if Executable.which('plutil')
+
+    it 'generates a correct Info.plist file' do
+      generator = Generator::InfoPlistFile.new('1.0.0', Platform.new(:ios, '6.0'))
+      file = temporary_directory + 'Info.plist'
+      generator.save_as(file)
+      Xcodeproj::Plist.read_from_path(file).should == {
+        'CFBundleDevelopmentRegion' => 'en',
+        'CFBundleExecutable' => '${EXECUTABLE_NAME}',
+        'CFBundleIdentifier' => '${PRODUCT_BUNDLE_IDENTIFIER}',
+        'CFBundleInfoDictionaryVersion' => '6.0',
+        'CFBundleName' => '${PRODUCT_NAME}',
+        'CFBundlePackageType' => 'FMWK',
+        'CFBundleShortVersionString' => '1.0.0',
+        'CFBundleSignature' => '????',
+        'CFBundleVersion' => '${CURRENT_PROJECT_VERSION}',
+        'NSPrincipalClass' => '',
+      }
+
+      it 'sets the package type' do
+        generator = Generator::InfoPlistFile.new('1.0.0', Platform.new(:ios, '6.0'), :appl)
+        file = temporary_directory + 'Info.plist'
+        generator.save_as(file)
+        Xcodeproj::Plist.read_from_path(file).should == {
+          'CFBundleDevelopmentRegion' => 'en',
+          'CFBundleExecutable' => '${EXECUTABLE_NAME}',
+          'CFBundleIdentifier' => '${PRODUCT_BUNDLE_IDENTIFIER}',
+          'CFBundleInfoDictionaryVersion' => '6.0',
+          'CFBundleName' => '${PRODUCT_NAME}',
+          'CFBundlePackageType' => 'APPL',
+          'CFBundleShortVersionString' => '1.0.0',
+          'CFBundleSignature' => '????',
+          'CFBundleVersion' => '${CURRENT_PROJECT_VERSION}',
+          'NSPrincipalClass' => '',
+        }
       end
 
-      it 'handles when the version is HEAD' do
-        version = Pod::Version.new('0.2.0')
-        version.head = true
-        @root_spec.stubs(:version).returns(version)
-        @generator.target_version.should == '0.2.0'
-      end
-
-      it 'handles when the version is more than 3 numeric parts' do
-        version = Pod::Version.new('0.2.0.1')
-        @root_spec.stubs(:version).returns(version)
-        @generator.target_version.should == '0.2.0'
-      end
-
-      it 'handles when the version is less than 3 numeric parts' do
-        version = Pod::Version.new('0.2')
-        @root_spec.stubs(:version).returns(version)
-        @generator.target_version.should == '0.2.0'
-      end
-
-      it 'handles when the version is a pre-release' do
-        version = Pod::Version.new('1.0.0-beta.1')
-        @root_spec.stubs(:version).returns(version)
-        @generator.target_version.should == '1.0.0'
-
-        version = Pod::Version.new('1.0-beta.5')
-        @root_spec.stubs(:version).returns(version)
-        @generator.target_version.should == '1.0.0'
+      it 'adds NSPrincipalClass for OSX platform' do
+        generator = Generator::InfoPlistFile.new('1.0.0', Platform.new(:osx, '10.8'), :appl)
+        file = temporary_directory + 'Info.plist'
+        generator.save_as(file)
+        Xcodeproj::Plist.read_from_path(file).should == {
+          'CFBundleDevelopmentRegion' => 'en',
+          'CFBundleExecutable' => '${EXECUTABLE_NAME}',
+          'CFBundleIdentifier' => '${PRODUCT_BUNDLE_IDENTIFIER}',
+          'CFBundleInfoDictionaryVersion' => '6.0',
+          'CFBundleName' => '${PRODUCT_NAME}',
+          'CFBundlePackageType' => 'APPL',
+          'CFBundleShortVersionString' => '1.0.0',
+          'CFBundleSignature' => '????',
+          'CFBundleVersion' => '${CURRENT_PROJECT_VERSION}',
+          'NSPrincipalClass' => 'NSApplication',
+        }
       end
     end
 
-    it 'returns the specification\'s version for the pod target' do
-      generator = Pod::Generator::InfoPlistFile.new(fixture_pod_target('orange-framework/OrangeFramework.podspec'))
-      generator.target_version.should == '0.1.0'
+    it 'properly formats serialized arrays' do
+      generator = Generator::InfoPlistFile.new('1.0.0', Platform.new(:ios, '6.0'))
+      generator.send(:to_plist, 'array' => %w(a b)).should == <<-PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>array</key>
+  <array>
+    <string>a</string>
+    <string>b</string>
+  </array>
+</dict>
+</plist>
+      PLIST
     end
-  end
 
-  it 'replaces the version in the generated plist' do
-    generator = Pod::Generator::InfoPlistFile.new(fixture_pod_target('orange-framework/OrangeFramework.podspec'))
-    generator.generate.should.include "<key>CFBundleShortVersionString</key>\n  <string>0.1.0</string>"
-  end
+    it 'uses the specified bundle_package_type' do
+      generator = Generator::InfoPlistFile.new('1.0.0', Platform.new(:ios, '6.0'), :bndl)
+      file = temporary_directory + 'Info.plist'
+      generator.save_as(file)
+      Xcodeproj::Plist.read_from_path(file)['CFBundlePackageType'].should == 'BNDL'
+    end
 
-  it 'generates a valid Info.plist file' do
-    generator = Pod::Generator::InfoPlistFile.new(mock('Target'))
-    file = temporary_directory + 'Info.plist'
-    generator.save_as(file)
-    `plutil -lint #{file}`
-    $?.should.be.success
+    it 'does not include a CFBundleExecutable for bundles' do
+      generator = Generator::InfoPlistFile.new('1.0.0', Platform.new(:ios, '6.0'), :bndl)
+      file = temporary_directory + 'Info.plist'
+      generator.save_as(file)
+      Xcodeproj::Plist.read_from_path(file).should.not.key('CFBundleExecutable')
+    end
   end
 end

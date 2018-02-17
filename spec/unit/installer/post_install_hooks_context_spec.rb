@@ -8,11 +8,12 @@ module Pod
 
       spec = fixture_spec('banana-lib/BananaLib.podspec')
       user_project = Xcodeproj::Project.open(SpecHelper.create_sample_app_copy_from_fixture('SampleProject'))
-      target_definition = Podfile::TargetDefinition.new('Pods', nil)
+      user_target = user_project.native_targets.find { |np| np.name == 'SampleProject' }
+      target_definition = fixture_target_definition
       pod_target = PodTarget.new([spec], [target_definition], config.sandbox)
       umbrella = AggregateTarget.new(target_definition, config.sandbox)
       umbrella.user_project = user_project
-      umbrella.user_target_uuids = ['UUID']
+      umbrella.user_target_uuids = [user_target.uuid]
       umbrella.stubs(:platform).returns(Platform.new(:ios, '8.0'))
       umbrella.pod_targets = [pod_target]
 
@@ -20,9 +21,11 @@ module Pod
       result.class.should == Installer::PostInstallHooksContext
       result.sandbox_root.should == '/path'
       result.pods_project.should == pods_project
+      result.sandbox.should == sandbox
       result.umbrella_targets.count.should == 1
       umbrella_target = result.umbrella_targets.first
-      umbrella_target.user_target_uuids.should == ['UUID']
+      umbrella_target.user_targets.should == [user_target]
+      umbrella_target.user_target_uuids.should == [user_target.uuid]
       umbrella_target.user_project.should == user_project
       umbrella_target.specs.should == [spec]
       umbrella_target.platform_name.should == :ios

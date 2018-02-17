@@ -1,3 +1,6 @@
+require 'active_support/multibyte/unicode'
+require 'find'
+
 module Pod
   class Sandbox
     # The PathList class is designed to perform multiple glob matches against
@@ -20,7 +23,8 @@ module Pod
       # @param  [Pathname] root The root of the PathList.
       #
       def initialize(root)
-        @root = root
+        root_dir = ActiveSupport::Multibyte::Unicode.normalize(root.to_s)
+        @root = Pathname.new(root_dir)
         @glob_cache = {}
       end
 
@@ -47,15 +51,23 @@ module Pod
         unless root.exist?
           raise Informative, "Attempt to read non existent folder `#{root}`."
         end
-        root_length  = root.to_s.length + 1
-        escaped_root = escape_path_for_glob(root)
-        paths = Dir.glob(escaped_root + '**/*', File::FNM_DOTMATCH)
-        absolute_dirs  = paths.select { |path| File.directory?(path) }
-        relative_dirs  = absolute_dirs.map  { |p| p[root_length..-1] }
-        absolute_paths = paths.reject { |p| p == "#{root}/." || p == "#{root}/.." }
-        relative_paths = absolute_paths.map { |p| p[root_length..-1] }
-        @files = relative_paths - relative_dirs
-        @dirs  = relative_dirs.map { |d| d.gsub(/\/\.\.?$/, '') }.reject { |d| d == '.' || d == '..' } .uniq
+
+        dirs = []
+        files = []
+        root_length = root.cleanpath.to_s.length + File::SEPARATOR.length
+        Find.find(root.to_s) do |f|
+          directory = File.directory?(f)
+          f = f.slice(root_length, f.length - root_length)
+          next if f.nil?
+
+          (directory ? dirs : files) << f
+        end
+
+        dirs.sort_by!(&:upcase)
+        files.sort_by!(&:upcase)
+
+        @dirs = dirs
+        @files = files
         @glob_cache = {}
       end
 

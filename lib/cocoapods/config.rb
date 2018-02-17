@@ -1,3 +1,5 @@
+require 'active_support/multibyte/unicode'
+
 module Pod
   # Stores the global configuration of CocoaPods.
   #
@@ -14,14 +16,8 @@ module Pod
     DEFAULTS = {
       :verbose             => false,
       :silent              => false,
-      :skip_repo_update    => false,
       :skip_download_cache => !ENV['COCOAPODS_SKIP_CACHE'].nil?,
 
-      :clean               => true,
-      :integrate_targets   => true,
-      :deduplicate_targets => true,
-      :deterministic_uuids => ENV['COCOAPODS_DISABLE_DETERMINISTIC_UUIDS'].nil?,
-      :lock_pod_source     => true,
       :new_version_message => ENV['COCOAPODS_SKIP_UPDATE_MESSAGE'].nil?,
 
       :cache_root          => Pathname.new(Dir.home) + 'Library/Caches/CocoaPods',
@@ -73,39 +69,6 @@ module Pod
     #-------------------------------------------------------------------------#
 
     # @!group Installation
-
-    # @return [Bool] Whether the installer should clean after the installation.
-    #
-    attr_accessor :clean
-    alias_method :clean?, :clean
-
-    # @return [Bool] Whether the installer should remove write permissions for
-    #                installed pod source files after the installation.
-    #
-    attr_accessor :lock_pod_source
-    alias_method :lock_pod_source?, :lock_pod_source
-
-    # @return [Bool] Whether CocoaPods should integrate a user target and build
-    #         the workspace or just create the Pods project.
-    #
-    attr_accessor :integrate_targets
-    alias_method :integrate_targets?, :integrate_targets
-
-    # @return [Bool] Whether CocoaPods should deduplicate pod targets.
-    #
-    attr_accessor :deduplicate_targets
-    alias_method :deduplicate_targets?, :deduplicate_targets
-
-    # @return [Bool] Whether CocoaPods should give the pods project
-    #                deterministic UUIDs.
-    #
-    attr_accessor :deterministic_uuids
-    alias_method :deterministic_uuids?, :deterministic_uuids
-
-    # @return [Bool] Whether the installer should skip the repos update.
-    #
-    attr_accessor :skip_repo_update
-    alias_method :skip_repo_update?, :skip_repo_update
 
     # @return [Bool] Whether the installer should skip the download cache.
     #
@@ -169,6 +132,11 @@ module Pod
 
     attr_writer :repos_dir
 
+    def sources_manager
+      return @sources_manager if @sources_manager && @sources_manager.repos_dir == repos_dir
+      @sources_manager = Source::Manager.new(repos_dir)
+    end
+
     # @return [Pathname] the directory where the CocoaPods templates are stored.
     #
     def templates_dir
@@ -179,7 +147,8 @@ module Pod
     #         Podfile is located.
     #
     def installation_root
-      current_path = Pathname.pwd
+      current_dir = ActiveSupport::Multibyte::Unicode.normalize(Dir.pwd)
+      current_path = Pathname.new(current_dir)
       unless @installation_root
         until current_path.root?
           if podfile_path_in_dir(current_path)

@@ -4,12 +4,12 @@ require 'cocoapods_stats/sender'
 
 # @return [Lockfile]
 #
-def generate_lockfile
+def generate_lockfile(lockfile_version: Pod::VERSION)
   hash = {}
   hash['PODS'] = []
   hash['DEPENDENCIES'] = []
-  hash['SPEC CHECKSUMS'] = []
-  hash['COCOAPODS'] = Pod::VERSION
+  hash['SPEC CHECKSUMS'] = {}
+  hash['COCOAPODS'] = lockfile_version
   Pod::Lockfile.new(hash)
 end
 
@@ -18,8 +18,13 @@ end
 def generate_podfile(pods = ['JSONKit'])
   Pod::Podfile.new do
     platform :ios
-    xcodeproj SpecHelper.fixture('SampleProject/SampleProject'), 'Test' => :debug, 'App Store' => :release
-    pods.each { |name| pod name }
+    project SpecHelper.fixture('SampleProject/SampleProject'), 'Test' => :debug, 'App Store' => :release
+    target 'SampleProject' do
+      pods.each { |name| pod name }
+      target 'SampleProjectTests' do
+        inherit! :search_paths
+      end
+    end
   end
 end
 
@@ -28,8 +33,13 @@ end
 def generate_local_podfile
   Pod::Podfile.new do
     platform :ios
-    xcodeproj SpecHelper.fixture('SampleProject/SampleProject'), 'Test' => :debug, 'App Store' => :release
-    pod 'Reachability', :path => SpecHelper.fixture('integration/Reachability')
+    project SpecHelper.fixture('SampleProject/SampleProject'), 'Test' => :debug, 'App Store' => :release
+    target 'SampleProject' do
+      pod 'Reachability', :path => SpecHelper.fixture('integration/Reachability')
+      target 'SampleProjectTests' do
+        inherit! :search_paths
+      end
+    end
   end
 end
 
@@ -41,8 +51,8 @@ module Pod
       CocoaPodsStats::Sender.any_instance.stubs(:send)
       podfile = generate_podfile
       lockfile = generate_lockfile
-      config.integrate_targets = false
       @installer = Installer.new(config.sandbox, podfile, lockfile)
+      @installer.installation_options.integrate_targets = false
     end
 
     #-------------------------------------------------------------------------#
@@ -51,15 +61,15 @@ module Pod
       before do
         @installer.stubs(:resolve_dependencies)
         @installer.stubs(:download_dependencies)
-        @installer.stubs(:determine_dependency_product_types)
-        @installer.stubs(:verify_no_duplicate_framework_names)
-        @installer.stubs(:verify_no_static_framework_transitive_dependencies)
-        @installer.stubs(:verify_framework_usage)
+        @installer.stubs(:validate_targets)
         @installer.stubs(:generate_pods_project)
         @installer.stubs(:integrate_user_project)
         @installer.stubs(:run_plugins_post_install_hooks)
         @installer.stubs(:ensure_plugins_are_installed!)
         @installer.stubs(:perform_post_install_actions)
+        Installer::Xcode::PodsProjectGenerator.any_instance.stubs(:share_development_pod_schemes)
+        Installer::Xcode::PodsProjectGenerator.any_instance.stubs(:generate!)
+        Installer::Xcode::PodsProjectGenerator.any_instance.stubs(:write)
       end
 
       it 'in runs the pre-install hooks before cleaning the Pod sources' do
@@ -77,80 +87,117 @@ module Pod
       end
 
       it 'in runs the post-install hooks before serializing the Pods project' do
-        @installer.stubs(:prepare_pods_project)
         @installer.stubs(:run_podfile_pre_install_hooks)
-        @installer.stubs(:install_file_references)
-        @installer.stubs(:install_libraries)
-        @installer.stubs(:set_target_dependencies)
         @installer.stubs(:write_lockfiles)
         @installer.stubs(:aggregate_targets).returns([])
         @installer.unstub(:generate_pods_project)
-        def @installer.run_podfile_post_install_hooks
-          @hook_called = true
-        end
+        generator = @installer.send(:create_generator)
+        @installer.stubs(:create_generator).returns(generator)
+        generator.stubs(:generate!)
+        generator.stubs(:share_development_pod_schemes)
 
-        def @installer.write_pod_project
-          @hook_called.should.be.true
-        end
+        hooks = sequence('hooks')
+        @installer.expects(:run_podfile_post_install_hooks).once.in_sequence(hooks)
+        generator.expects(:write).once.in_sequence(hooks)
+
         @installer.install!
       end
 
-      it 'runs source provider hooks before analyzing' do
-        config.skip_repo_update = true
-        @installer.unstub(:resolve_dependencies)
-        @installer.stubs(:validate_build_configurations)
-        @installer.stubs(:prepare_for_legacy_compatibility)
-        @installer.stubs(:clean_sandbox)
-        def @installer.run_source_provider_hooks
-          @hook_called = true
+      describe 'handling spec sources' do
+        before do
+          @hooks_manager = Pod::HooksManager
+          @hooks_manager.instance_variable_set(:@registrations, nil)
         end
 
-        def @installer.analyze(*)
+        it 'runs source provider hooks before analyzing' do
+          @installer.unstub(:resolve_dependencies)
+          @installer.stubs(:validate_build_configurations)
+          @installer.stubs(:clean_sandbox)
+          @installer.stubs(:analyze)
+          @installer.stubs(:run_source_provider_hooks).with do
+            @hook_called = true
+          end
+          @installer.install!
           @hook_called.should.be.true
         end
-        @installer.install!
-      end
 
-      it 'includes sources from source provider plugins' do
-        plugin_name = 'test-plugin'
-        Pod::HooksManager.register(plugin_name, :source_provider) do |context, options|
-          source_url = options['sources'].first
-          return unless source_url
-          source = Pod::Source.new(source_url)
-          context.add_source(source)
+        it 'includes sources from source provider plugins' do
+          plugin_name = 'test-plugin'
+          @hooks_manager.register(plugin_name, :source_provider) do |context, options|
+            source_url = options['sources'].first
+            return unless source_url
+            source = Pod::Source.new(source_url)
+            context.add_source(source)
+          end
+
+          test_source_name = 'https://github.com/artsy/CustomSpecs.git'
+          plugins_hash = Installer::DEFAULT_PLUGINS.merge(plugin_name => { 'sources' => [test_source_name] })
+          @installer.podfile.stubs(:plugins).returns(plugins_hash)
+          @installer.unstub(:resolve_dependencies)
+          @installer.stubs(:validate_build_configurations)
+          @installer.stubs(:clean_sandbox)
+          @installer.stubs(:analyze)
+          Installer::Analyzer.any_instance.stubs(:update_repositories)
+
+          analyzer = @installer.resolve_dependencies
+
+          source = Pod::Source.new(test_source_name)
+          names = analyzer.sources.map(&:name)
+          names.should.include(source.name)
         end
 
-        test_source_name = 'https://github.com/artsy/Specs.git'
-        plugins_hash = Installer::DEFAULT_PLUGINS.merge(plugin_name => { 'sources' => [test_source_name] })
-        @installer.podfile.stubs(:plugins).returns(plugins_hash)
-        @installer.unstub(:resolve_dependencies)
-        @installer.stubs(:validate_build_configurations)
-        @installer.stubs(:prepare_for_legacy_compatibility)
-        @installer.stubs(:clean_sandbox)
-        @installer.stubs(:ensure_plugins_are_installed!)
-        @installer.stubs(:analyze)
-        config.skip_repo_update = true
+        it 'does not automatically add master spec repo if plugin sources exist' do
+          plugin_name = 'test-plugin'
+          @hooks_manager.register(plugin_name, :source_provider) do |context, options|
+            source_url = options['sources'].first
+            return unless source_url
+            source = Pod::Source.new(source_url)
+            context.add_source(source)
+          end
 
-        analyzer = Installer::Analyzer.new(config.sandbox, @installer.podfile, @installer.lockfile)
-        analyzer.stubs(:analyze)
-        @installer.stubs(:create_analyzer).returns(analyzer)
-        @installer.install!
+          test_source_name = 'https://github.com/artsy/CustomSpecs.git'
+          plugins_hash = Installer::DEFAULT_PLUGINS.merge(plugin_name => { 'sources' => [test_source_name] })
+          @installer.podfile.stubs(:plugins).returns(plugins_hash)
+          @installer.unstub(:resolve_dependencies)
+          @installer.stubs(:validate_build_configurations)
+          @installer.stubs(:clean_sandbox)
+          @installer.stubs(:analyze)
+          Installer::Analyzer.any_instance.stubs(:update_repositories)
 
-        source = Pod::Source.new(test_source_name)
-        names = analyzer.sources.map(&:name)
-        names.should.include(source.name)
+          analyzer = @installer.resolve_dependencies
+          names = analyzer.sources.map(&:name)
+          names.should == [Pod::Source.new('https://github.com/artsy/CustomSpecs.git').name]
+        end
       end
 
       it 'integrates the user targets if the corresponding config is set' do
-        config.integrate_targets = true
+        @installer.installation_options.integrate_targets = true
         @installer.expects(:integrate_user_project)
         @installer.install!
       end
 
       it "doesn't integrates the user targets if the corresponding config is not set" do
-        config.integrate_targets = false
+        @installer.installation_options.integrate_targets = false
         @installer.expects(:integrate_user_project).never
         @installer.install!
+        UI.output.should.include 'Skipping User Project Integration'
+      end
+
+      it 'includes pod targets from test dependent targets' do
+        pod_target_one = stub(:test_dependent_targets => [])
+        pod_target_three = stub(:test_dependent_targets => [])
+        pod_target_two = stub(:test_dependent_targets => [pod_target_three])
+        aggregate_target = stub(:pod_targets => [pod_target_one, pod_target_two])
+
+        result = stub(:targets => [aggregate_target])
+
+        analyzer = Installer::Analyzer.new(config.sandbox, @installer.podfile, @installer.lockfile)
+        analyzer.stubs(:analyze).returns(result)
+        analyzer.stubs(:result).returns(result)
+
+        @installer.stubs(:create_analyzer).returns(analyzer)
+        @installer.send(:analyze)
+        @installer.pod_targets.should == [pod_target_one, pod_target_two, pod_target_three]
       end
 
       it 'prints a list of deprecated pods' do
@@ -165,6 +212,50 @@ module Pod
         UI.warnings.should.include 'deprecated in favor of AFNetworking'
         UI.warnings.should.include 'BlocksKit has been deprecated'
       end
+
+      it 'does not raise if command is run outside sandbox directory' do
+        Dir.chdir(@installer.sandbox.root.parent) do
+          should.not.raise(Informative) { @installer.install! }
+        end
+      end
+
+      it 'raises if command is run in sandbox directory' do
+        Dir.chdir(@installer.sandbox.root) do
+          should.raise Informative do
+            @installer.install!
+          end.message.should.match /should.*run.*outside.*Pods directory.*Current directory.*\./m
+        end
+      end
+
+      describe 'handling CocoaPods version updates' do
+        it 'does not deintegrate when there is no lockfile' do
+          installer = Pod::Installer.new(config.sandbox, generate_podfile, nil)
+          UI.expects(:section).never
+          installer.send(:deintegrate_if_different_major_version)
+        end
+
+        it 'does not deintegrate when the major version is the same' do
+          should_not_deintegrate = %w(1.0.0 1.0.1 1.1.0 1.2.2)
+          should_not_deintegrate.each do |version|
+            lockfile = generate_lockfile(:lockfile_version => version)
+            installer = Pod::Installer.new(config.sandbox, generate_podfile, lockfile)
+            Pathname.expects(:glob).never
+            installer.send(:deintegrate_if_different_major_version)
+          end
+        end
+
+        it 'does deintegrate when the major version is different' do
+          should_not_deintegrate = %w(0.39.0 2.0.0 10.0-beta)
+          should_not_deintegrate.each do |version|
+            lockfile = generate_lockfile(:lockfile_version => version)
+            installer = Pod::Installer.new(config.sandbox, generate_podfile, lockfile)
+            project = fixture('SampleProject/SampleProject.xcodeproj')
+            Pathname.expects(:glob).with(config.installation_root + '*.xcodeproj').returns([project])
+            Deintegrator.any_instance.expects(:deintegrate_project)
+            installer.send(:deintegrate_if_different_major_version)
+          end
+        end
+      end
     end
 
     #-------------------------------------------------------------------------#
@@ -176,20 +267,23 @@ module Pod
         config.repos_dir = fixture_path + 'spec-repos'
         podfile = Pod::Podfile.new do
           platform :ios, '8.0'
-          xcodeproj 'SampleProject/SampleProject'
+          project 'SampleProject/SampleProject'
           use_frameworks!
           pod 'BananaLib',       :path => (fixture_path + 'banana-lib').to_s
           pod 'OrangeFramework', :path => (fixture_path + 'orange-framework').to_s
+          pod 'matryoshka',      :path => (fixture_path + 'matryoshka').to_s
           pod 'monkey',          :path => (fixture_path + 'monkey').to_s
 
-          target 'TestRunner', :exclusive => true do
+          target 'SampleProject'
+          target 'TestRunner' do
+            inherit! :search_paths
             pod 'monkey', :path => (fixture_path + 'monkey').to_s
           end
         end
         lockfile = generate_lockfile
-        config.integrate_targets = false
 
         @installer = Installer.new(config.sandbox, podfile, lockfile)
+        @installer.installation_options.integrate_targets = false
         @installer.install!
 
         target = @installer.aggregate_targets.first
@@ -197,6 +291,7 @@ module Pod
         target.pod_targets.select(&:requires_frameworks?).map(&:name).sort.should == %w(
           BananaLib
           OrangeFramework
+          matryoshka
           monkey
         )
       end
@@ -204,97 +299,18 @@ module Pod
 
     #-------------------------------------------------------------------------#
 
-    describe '#verify_no_duplicate_framework_names' do
-      it 'detects duplicate framework names' do
-        Sandbox::FileAccessor.any_instance.stubs(:vendored_frameworks).returns([Pathname('monkey.framework')])
-        fixture_path = ROOT + 'spec/fixtures'
-        config.repos_dir = fixture_path + 'spec-repos'
-        podfile = Pod::Podfile.new do
-          platform :ios, '8.0'
-          xcodeproj 'SampleProject/SampleProject'
-          pod 'BananaLib',       :path => (fixture_path + 'banana-lib').to_s
-          pod 'OrangeFramework', :path => (fixture_path + 'orange-framework').to_s
-          pod 'monkey',          :path => (fixture_path + 'monkey').to_s
-        end
-        lockfile = generate_lockfile
-        config.integrate_targets = false
-
-        @installer = Installer.new(config.sandbox, podfile, lockfile)
-        should.raise(Informative) { @installer.install! }.message.should.match /conflict.*monkey/
-      end
-    end
-
-    #-------------------------------------------------------------------------#
-
-    describe '#verify_no_static_framework_transitive_dependencies' do
-      before do
-        fixture_path = ROOT + 'spec/fixtures'
-        config.repos_dir = fixture_path + 'spec-repos'
-        config.integrate_targets = false
-        @podfile = Pod::Podfile.new do
-          platform :ios, '8.0'
-          xcodeproj 'SampleProject/SampleProject'
-          use_frameworks!
-          pod 'BananaLib',       :path => (fixture_path + 'banana-lib').to_s
-          pod 'OrangeFramework', :path => (fixture_path + 'orange-framework').to_s
-          pod 'monkey',          :path => (fixture_path + 'monkey').to_s
-        end
-        @lockfile = generate_lockfile
-      end
-
-      it 'detects transitive static dependencies which are linked directly to the user target' do
-        Sandbox::FileAccessor.any_instance.stubs(:vendored_libraries).returns([Pathname('/libThing.a')])
-        @installer = Installer.new(config.sandbox, @podfile, @lockfile)
-        should.raise(Informative) { @installer.install! }.message.should.match /transitive.*libThing/
-      end
-
-      it 'allows transitive static dependencies which contain other source code' do
-        Sandbox::FileAccessor.any_instance.stubs(:source_files).returns([Pathname('/yolo.m')])
-        Sandbox::FileAccessor.any_instance.stubs(:vendored_libraries).returns([Pathname('/libThing.a')])
-        @installer = Installer.new(config.sandbox, @podfile, @lockfile)
-        should.not.raise(Informative) { @installer.install! }
-      end
-
-      it 'allows transitive static dependencies when both dependencies are linked against the user target' do
-        PodTarget.any_instance.stubs(:should_build? => false)
-        Sandbox::FileAccessor.any_instance.stubs(:vendored_libraries).returns([Pathname('/libThing.a')])
-        @installer = Installer.new(config.sandbox, @podfile, @lockfile)
-        should.not.raise(Informative) { @installer.install! }
-      end
-    end
-
-    #-------------------------------------------------------------------------#
-
-    describe '#verify_framework_usage' do
-      it 'raises when Swift pods are used without explicit `use_frameworks!`' do
-        fixture_path = ROOT + 'spec/fixtures'
-        config.repos_dir = fixture_path + 'spec-repos'
-        podfile = Pod::Podfile.new do
-          platform :ios, '8.0'
-          xcodeproj 'SampleProject/SampleProject'
-          pod 'OrangeFramework', :path => (fixture_path + 'orange-framework').to_s
-        end
-        lockfile = generate_lockfile
-        config.integrate_targets = false
-
-        @installer = Installer.new(config.sandbox, podfile, lockfile)
-        should.raise(Informative) { @installer.install! }.message.should.match /use_frameworks/
-      end
-    end
-
-    #-------------------------------------------------------------------------#
-
     describe 'Dependencies Resolution' do
       describe 'updating spec repos' do
-        it 'does not updates the repositories if config indicates to skip them' do
-          config.skip_repo_update = true
-          SourcesManager.expects(:update).never
+        it 'does not update the repositories by default' do
+          FileUtils.mkdir_p(config.sandbox.target_support_files_root)
+          config.sources_manager.expects(:update).never
           @installer.send(:resolve_dependencies)
         end
 
-        it 'updates the repositories by default' do
-          config.skip_repo_update = false
-          SourcesManager.expects(:update).once
+        it 'updates the repositories if that was requested' do
+          FileUtils.mkdir_p(config.sandbox.target_support_files_root)
+          @installer.repo_update = true
+          config.sources_manager.expects(:update).once
           @installer.send(:resolve_dependencies)
         end
       end
@@ -310,12 +326,12 @@ module Pod
 
         it 'analyzes the Podfile, the Lockfile and the Sandbox' do
           @installer.send(:analyze)
-          @installer.analysis_result.sandbox_state.added.should == ['JSONKit']
+          @installer.analysis_result.sandbox_state.added.should == Set.new(%w(JSONKit))
         end
 
         it 'stores the targets created by the analyzer' do
           @installer.send(:analyze)
-          @installer.aggregate_targets.map(&:name).sort.should == ['Pods']
+          @installer.aggregate_targets.map(&:name).sort.should == ['Pods-SampleProject', 'Pods-SampleProjectTests']
           @installer.pod_targets.map(&:name).sort.should == ['JSONKit']
         end
 
@@ -323,7 +339,7 @@ module Pod
           @installer.update = true
           Installer::Analyzer.any_instance.expects(:update=).with(true)
           @installer.send(:analyze)
-          @installer.aggregate_targets.map(&:name).sort.should == ['Pods']
+          @installer.aggregate_targets.map(&:name).sort.should == ['Pods-SampleProject', 'Pods-SampleProjectTests']
           @installer.pod_targets.map(&:name).sort.should == ['JSONKit']
         end
       end
@@ -357,12 +373,16 @@ module Pod
           @analysis_result = Installer::Analyzer::AnalysisResult.new
           @analysis_result.specifications = []
           @analysis_result.sandbox_state = Installer::Analyzer::SpecsState.new
-          @pod_targets = [PodTarget.new([stub('Spec')], [stub('TargetDefinition')], config.sandbox)]
+          @spec = stub(:name => 'Spec', :test_specification? => false)
+          @spec.stubs(:root => @spec)
+          @pod_targets = [PodTarget.new([@spec], [fixture_target_definition], config.sandbox)]
           @installer.stubs(:analysis_result).returns(@analysis_result)
           @installer.stubs(:pod_targets).returns(@pod_targets)
+          @installer.stubs(:aggregate_targets).returns([])
         end
 
         it 'cleans the header stores' do
+          FileUtils.mkdir_p(config.sandbox.target_support_files_root)
           config.sandbox.public_headers.expects(:implode!)
           @installer.pod_targets.each do |pods_target|
             pods_target.build_headers.expects(:implode!)
@@ -371,9 +391,60 @@ module Pod
         end
 
         it 'deletes the sources of the removed Pods' do
+          FileUtils.mkdir_p(config.sandbox.target_support_files_root)
           @analysis_result.sandbox_state.add_name('Deleted-Pod', :deleted)
           config.sandbox.expects(:clean_pod).with('Deleted-Pod')
           @installer.send(:clean_sandbox)
+        end
+
+        it 'deletes the target support file dirs of the removed pod targets' do
+          FileUtils.mkdir_p(config.sandbox.target_support_files_root)
+          FileUtils.mkdir_p(@installer.pod_targets.first.support_files_dir)
+          config.sandbox.target_support_files_root.children.map(&:basename).map(&:to_s).should == [
+            'Spec',
+          ]
+          @installer.stubs(:pod_targets).returns([])
+          @installer.send(:clean_sandbox)
+          config.sandbox.target_support_files_root.children.map(&:basename).map(&:to_s).should.be.empty
+        end
+
+        it 'does not delete the target support file dirs for non removed pod targets' do
+          FileUtils.mkdir_p(config.sandbox.target_support_files_root)
+          FileUtils.mkdir_p(@installer.pod_targets.first.support_files_dir)
+          config.sandbox.target_support_files_root.children.map(&:basename).map(&:to_s).should == [
+            'Spec',
+          ]
+          @installer.send(:clean_sandbox)
+          config.sandbox.target_support_files_root.children.map(&:basename).map(&:to_s).should == [
+            'Spec',
+          ]
+        end
+
+        it 'deletes the target support file dirs of the removed aggregate targets' do
+          aggregate_target = AggregateTarget.new(fixture_target_definition('MyApp'), config.sandbox)
+          @installer.stubs(:aggregate_targets).returns([aggregate_target])
+          FileUtils.mkdir_p(config.sandbox.target_support_files_root)
+          FileUtils.mkdir_p(@installer.aggregate_targets.first.support_files_dir)
+          config.sandbox.target_support_files_root.children.map(&:basename).map(&:to_s).should == [
+            'Pods-MyApp',
+          ]
+          @installer.stubs(:aggregate_targets).returns([])
+          @installer.send(:clean_sandbox)
+          config.sandbox.target_support_files_root.children.map(&:basename).map(&:to_s).should.be.empty
+        end
+
+        it 'does not delete the target support file dirs for non removed aggregate targets' do
+          aggregate_target = AggregateTarget.new(fixture_target_definition('MyApp'), config.sandbox)
+          @installer.stubs(:aggregate_targets).returns([aggregate_target])
+          FileUtils.mkdir_p(config.sandbox.target_support_files_root)
+          FileUtils.mkdir_p(@installer.aggregate_targets.first.support_files_dir)
+          config.sandbox.target_support_files_root.children.map(&:basename).map(&:to_s).should == [
+            'Pods-MyApp',
+          ]
+          @installer.send(:clean_sandbox)
+          config.sandbox.target_support_files_root.children.map(&:basename).map(&:to_s).should == [
+            'Pods-MyApp',
+          ]
         end
       end
     end
@@ -381,24 +452,6 @@ module Pod
     #-------------------------------------------------------------------------#
 
     describe 'Downloading dependencies' do
-      it 'installs head pods' do
-        podfile = Podfile.new do
-          platform :osx, '10.10'
-          pod 'CargoBay', '2.1.0'
-          pod 'AFNetworking/NSURLSession', :head
-        end
-        @installer.stubs(:podfile).returns(podfile)
-        @installer.stubs(:lockfile).returns(nil)
-        Downloader::Git.any_instance.expects(:download).once
-        Downloader::Git.any_instance.expects(:download_head).once
-        Downloader::Git.any_instance.stubs(:checkout_options).returns({})
-        @installer.prepare
-        @installer.resolve_dependencies
-        @installer.send(:root_specs).sort_by(&:name).map(&:version).map(&:head?).should == [true, nil]
-        @installer.download_dependencies
-        UI.output.should.include 'HEAD based on 2.4.1'
-      end
-
       describe '#install_pod_sources' do
         it 'installs all the Pods which are marked as needing installation' do
           spec = fixture_spec('banana-lib/BananaLib.podspec')
@@ -416,7 +469,7 @@ module Pod
 
         it 'correctly configures the Pod source installer' do
           spec = fixture_spec('banana-lib/BananaLib.podspec')
-          pod_target = PodTarget.new([spec], [stub('TargetDefinition')], config.sandbox)
+          pod_target = PodTarget.new([spec], [fixture_target_definition], config.sandbox)
           pod_target.stubs(:platform).returns(:ios)
           @installer.stubs(:pod_targets).returns([pod_target])
           @installer.instance_variable_set(:@installed_specs, [])
@@ -426,7 +479,7 @@ module Pod
 
         it 'maintains the list of the installed specs' do
           spec = fixture_spec('banana-lib/BananaLib.podspec')
-          pod_target = PodTarget.new([spec], [stub('TargetDefinition')], config.sandbox)
+          pod_target = PodTarget.new([spec], [fixture_target_definition], config.sandbox)
           pod_target.stubs(:platform).returns(:ios)
           @installer.stubs(:pod_targets).returns([pod_target, pod_target])
           @installer.instance_variable_set(:@installed_specs, [])
@@ -451,11 +504,50 @@ module Pod
           UI.output.should.include 'was 1.0'
         end
 
+        it 'raises when it attempts to install pod source with no target supporting it' do
+          spec = fixture_spec('banana-lib/BananaLib.podspec')
+          pod_target = PodTarget.new([spec], [fixture_target_definition], config.sandbox)
+          pod_target.stubs(:platform).returns(:ios)
+          @installer.stubs(:pod_targets).returns([pod_target])
+          should.raise Informative do
+            @installer.send(:create_pod_installer, 'RandomPod')
+          end.message.should.include 'Could not install \'RandomPod\' pod. There is no target that supports it.'
+        end
+
+        it 'prints a warning for installed pods that included script phases' do
+          spec = fixture_spec('coconut-lib/CoconutLib.podspec')
+          spec.test_specs.first.script_phase = { :name => 'Hello World', :script => 'echo "Hello World"' }
+          pod_target = PodTarget.new([spec, *spec.test_specs], [fixture_target_definition], config.sandbox)
+          pod_target.stubs(:platform).returns(:ios)
+          sandbox_state = Installer::Analyzer::SpecsState.new
+          sandbox_state.added << 'CoconutLib'
+          @installer.stubs(:pod_targets).returns([pod_target])
+          @installer.stubs(:root_specs).returns([spec])
+          @installer.stubs(:sandbox_state).returns(sandbox_state)
+          @installer.send(:warn_for_installed_script_phases)
+          UI.warnings.should.include 'CoconutLib has added 1 script phase. Please inspect before executing a build. ' \
+            'See `https://guides.cocoapods.org/syntax/podspec.html#script_phases` for more information.'
+        end
+
+        it 'does not print a warning for already installed pods that include script phases' do
+          spec = fixture_spec('coconut-lib/CoconutLib.podspec')
+          spec.test_specs.first.script_phase = { :name => 'Hello World', :script => 'echo "Hello World"' }
+          pod_target = PodTarget.new([spec, *spec.test_specs], [fixture_target_definition], config.sandbox)
+          pod_target.stubs(:platform).returns(:ios)
+          sandbox_state = Installer::Analyzer::SpecsState.new
+          sandbox_state.unchanged << 'CoconutLib'
+          @installer.stubs(:pod_targets).returns([pod_target])
+          @installer.stubs(:root_specs).returns([spec])
+          @installer.stubs(:sandbox_state).returns(sandbox_state)
+          @installer.send(:warn_for_installed_script_phases)
+          UI.warnings.should.be.empty
+        end
+
         #--------------------------------------#
 
         describe '#clean' do
           it 'it cleans only if the config instructs to do it' do
-            config.clean = false
+            @installer.installation_options.clean = false
             @installer.send(:clean_pod_sources)
             Installer::PodSourceInstaller.any_instance.expects(:install!).never
           end
@@ -468,267 +560,11 @@ module Pod
     #-------------------------------------------------------------------------#
 
     describe 'Generating pods project' do
-      describe '#prepare_pods_project' do
-        before do
-          @installer.stubs(:aggregate_targets).returns([])
-        end
-
-        it "creates build configurations for all of the user's targets" do
-          config.integrate_targets = true
-          @installer.send(:analyze)
-          @installer.send(:prepare_pods_project)
-          @installer.pods_project.build_configurations.map(&:name).sort.should == ['App Store', 'Debug', 'Release', 'Test']
-        end
-
-        it 'sets STRIP_INSTALLED_PRODUCT to NO for all configurations for the whole project' do
-          config.integrate_targets = true
-          @installer.send(:analyze)
-          @installer.send(:prepare_pods_project)
-          @installer.pods_project.build_settings('Debug')['STRIP_INSTALLED_PRODUCT'].should == 'NO'
-          @installer.pods_project.build_settings('Test')['STRIP_INSTALLED_PRODUCT'].should == 'NO'
-          @installer.pods_project.build_settings('Release')['STRIP_INSTALLED_PRODUCT'].should == 'NO'
-          @installer.pods_project.build_settings('App Store')['STRIP_INSTALLED_PRODUCT'].should == 'NO'
-        end
-
-        before do
-          @installer.stubs(:analysis_result).returns(stub(:all_user_build_configurations => {}, :target_inspections => nil))
-        end
-
-        it 'creates the Pods project' do
-          @installer.send(:prepare_pods_project)
-          @installer.pods_project.class.should == Pod::Project
-        end
-
-        it 'preserves Pod paths specified as absolute or rooted to home' do
-          local_podfile = generate_local_podfile
-          local_installer = Installer.new(config.sandbox, local_podfile)
-          local_installer.send(:analyze)
-          local_installer.send(:prepare_pods_project)
-          group = local_installer.pods_project.group_for_spec('Reachability')
-          Pathname.new(group.path).should.be.absolute
-        end
-
-        it 'adds the Podfile to the Pods project' do
-          config.stubs(:podfile_path).returns(Pathname.new('/Podfile'))
-          @installer.send(:prepare_pods_project)
-          @installer.pods_project['Podfile'].should.be.not.nil
-        end
-
-        it 'sets the deployment target for the whole project' do
-          pod_target_ios = PodTarget.new([stub('Spec')], [stub('TargetDefinition')], config.sandbox)
-          pod_target_osx = PodTarget.new([stub('Spec')], [stub('TargetDefinition')], config.sandbox)
-          pod_target_ios.stubs(:platform).returns(Platform.new(:ios, '6.0'))
-          pod_target_osx.stubs(:platform).returns(Platform.new(:osx, '10.8'))
-          aggregate_target_ios = AggregateTarget.new(nil, config.sandbox)
-          aggregate_target_osx = AggregateTarget.new(nil, config.sandbox)
-          aggregate_target_ios.stubs(:platform).returns(Platform.new(:ios, '6.0'))
-          aggregate_target_osx.stubs(:platform).returns(Platform.new(:osx, '10.8'))
-          @installer.stubs(:aggregate_targets).returns([aggregate_target_ios, aggregate_target_osx])
-          @installer.stubs(:pod_targets).returns([])
-          @installer.send(:prepare_pods_project)
-          build_settings = @installer.pods_project.build_configurations.map(&:build_settings)
-          build_settings.each do |build_setting|
-            build_setting['MACOSX_DEPLOYMENT_TARGET'].should == '10.8'
-            build_setting['IPHONEOS_DEPLOYMENT_TARGET'].should == '6.0'
-          end
-        end
-      end
-
-      #--------------------------------------#
-
-      describe '#install_file_references' do
-        it 'installs the file references' do
-          @installer.stubs(:pod_targets).returns([])
-          Installer::FileReferencesInstaller.any_instance.expects(:install!)
-          @installer.send(:install_file_references)
-        end
-      end
-
-      #--------------------------------------#
-
-      describe '#install_libraries' do
-        it 'install the targets of the Pod project' do
-          spec = fixture_spec('banana-lib/BananaLib.podspec')
-          target_definition = Podfile::TargetDefinition.new(:default, nil)
-          target_definition.store_pod('BananaLib')
-          pod_target = PodTarget.new([spec], [target_definition], config.sandbox)
-          @installer.stubs(:aggregate_targets).returns([])
-          @installer.stubs(:pod_targets).returns([pod_target])
-          Installer::PodTargetInstaller.any_instance.expects(:install!)
-          @installer.send(:install_libraries)
-        end
-
-        it 'skips empty pod targets' do
-          spec = fixture_spec('banana-lib/BananaLib.podspec')
-          target_definition = Podfile::TargetDefinition.new(:default, nil)
-          pod_target = PodTarget.new([spec], [target_definition], config.sandbox)
-          @installer.stubs(:aggregate_targets).returns([])
-          @installer.stubs(:pod_targets).returns([pod_target])
-          Installer::PodTargetInstaller.any_instance.expects(:install!).never
-          @installer.send(:install_libraries)
-        end
-
-        xit 'adds the frameworks required by to the pod to the project for informative purposes' do
-          Specification::Consumer.any_instance.stubs(:frameworks).returns(['QuartzCore'])
-          @installer.install!
-          names = @installer.sandbox.project['Frameworks'].children.map(&:name)
-          names.sort.should == ['Foundation.framework', 'QuartzCore.framework']
-        end
-      end
-
-      #--------------------------------------#
-
-      describe '#set_target_dependencies' do
-        def test_extension_target(symbol_type)
-          mock_user_target = mock('UserTarget', :symbol_type => symbol_type)
-          @target.stubs(:user_targets).returns([mock_user_target])
-
-          build_settings = {}
-          mock_configuration = mock('BuildConfiguration', :build_settings => build_settings)
-          @mock_target.stubs(:build_configurations).returns([mock_configuration])
-
-          @installer.send(:set_target_dependencies)
-
-          build_settings.should == { 'APPLICATION_EXTENSION_API_ONLY' => 'YES' }
-        end
-
-        before do
-          spec = fixture_spec('banana-lib/BananaLib.podspec')
-
-          target_definition = Podfile::TargetDefinition.new(:default, @installer.podfile)
-          @pod_target = PodTarget.new([spec], [target_definition], config.sandbox)
-          @target = AggregateTarget.new(target_definition, config.sandbox)
-
-          @mock_target = mock('PodNativeTarget')
-
-          mock_project = mock('PodsProject', :frameworks_group => mock('FrameworksGroup'))
-          @installer.stubs(:pods_project).returns(mock_project)
-
-          @target.stubs(:native_target).returns(@mock_target)
-          @target.stubs(:pod_targets).returns([@pod_target])
-          @installer.stubs(:aggregate_targets).returns([@target])
-        end
-
-        it 'sets resource bundles for not build pods as target dependencies of the user target' do
-          @pod_target.stubs(:resource_bundle_targets).returns(['dummy'])
-          @pod_target.stubs(:should_build? => false)
-          @mock_target.expects(:add_dependency).with('dummy')
-
-          @installer.send(:set_target_dependencies)
-        end
-
-        it 'configures APPLICATION_EXTENSION_API_ONLY for app extension targets' do
-          test_extension_target(:app_extension)
-        end
-
-        it 'configures APPLICATION_EXTENSION_API_ONLY for watch extension targets' do
-          test_extension_target(:watch_extension)
-        end
-
-        it 'configures APPLICATION_EXTENSION_API_ONLY for watchOS 2 extension targets' do
-          test_extension_target(:watch2_extension)
-        end
-
-        it 'configures APPLICATION_EXTENSION_API_ONLY for tvOS extension targets' do
-          test_extension_target(:tv_extension)
-        end
-
-        it 'configures APPLICATION_EXTENSION_API_ONLY for targets where the user target has it set' do
-          mock_user_target = mock('UserTarget', :symbol_type => :application)
-          mock_user_target.expects(:common_resolved_build_setting).with('APPLICATION_EXTENSION_API_ONLY').returns('YES')
-          @target.stubs(:user_targets).returns([mock_user_target])
-
-          build_settings = {}
-          mock_configuration = mock('BuildConfiguration', :build_settings => build_settings)
-          @mock_target.stubs(:build_configurations).returns([mock_configuration])
-
-          @installer.send(:set_target_dependencies)
-
-          build_settings.should == { 'APPLICATION_EXTENSION_API_ONLY' => 'YES' }
-        end
-
-        it 'does not try to set APPLICATION_EXTENSION_API_ONLY if there are no pod targets' do
-          lambda do
-            mock_user_target = mock('UserTarget', :symbol_type => :app_extension)
-            @target.stubs(:user_targets).returns([mock_user_target])
-
-            @target.stubs(:native_target).returns(nil)
-            @target.stubs(:pod_targets).returns([])
-
-            @installer.send(:set_target_dependencies)
-          end.should.not.raise NoMethodError
-        end
-
-        xit 'sets the pod targets as dependencies of the aggregate target' do
-        end
-
-        xit 'sets the dependecies of the pod targets' do
-        end
-
-        xit 'is robusts against subspecs' do
-        end
-      end
-
-      #--------------------------------------#
-
-      describe '#write_pod_project' do
-        before do
-          @installer.stubs(:aggregate_targets).returns([])
-          @installer.stubs(:analysis_result).returns(stub(:all_user_build_configurations => {}, :target_inspections => nil))
-          @installer.send(:prepare_pods_project)
-        end
-
-        it 'recursively sorts the project' do
-          Xcodeproj::Project.any_instance.stubs(:recreate_user_schemes)
-          @installer.pods_project.main_group.expects(:sort)
-          @installer.send(:write_pod_project)
-        end
-
-        it 'saves the project to the given path' do
-          Xcodeproj::Project.any_instance.stubs(:recreate_user_schemes)
-          temporary_directory + 'Pods/Pods.xcodeproj'
-          @installer.pods_project.expects(:save)
-          @installer.send(:write_pod_project)
-        end
-
-        it 'shares schemes of development pods' do
-          spec = fixture_spec('banana-lib/BananaLib.podspec')
-          pod_target = fixture_pod_target(spec)
-
-          @installer.stubs(:pod_targets).returns([pod_target])
-          @installer.sandbox.stubs(:development_pods).returns('BananaLib' => nil)
-
-          Xcodeproj::XCScheme.expects(:share_scheme).with(
-            @installer.pods_project.path,
-            'BananaLib')
-
-          @installer.send(:share_development_pod_schemes)
-        end
-
-        it "uses the user project's object version for the pods project" do
-          tmp_directory = Pathname(Dir.tmpdir) + 'CocoaPods'
-          FileUtils.mkdir_p(tmp_directory)
-          proj = Xcodeproj::Project.new(tmp_directory + 'Yolo.xcodeproj', false, 1)
-          proj.save
-
-          aggregate_target = AggregateTarget.new(nil, config.sandbox)
-          aggregate_target.stubs(:platform).returns(Platform.new(:ios, '6.0'))
-          aggregate_target.stubs(:user_project).returns(proj)
-          @installer.stubs(:aggregate_targets).returns([aggregate_target])
-
-          @installer.send(:prepare_pods_project)
-          @installer.pods_project.object_version.should == '1'
-
-          FileUtils.rm_rf(tmp_directory)
-        end
-      end
-
-      #--------------------------------------#
-
       describe '#write_lockfiles' do
         before do
           @analysis_result = Installer::Analyzer::AnalysisResult.new
           @analysis_result.specifications = [fixture_spec('banana-lib/BananaLib.podspec')]
+          @analysis_result.specs_by_source = {}
           @installer.stubs(:analysis_result).returns(@analysis_result)
         end
 
@@ -755,7 +591,7 @@ module Pod
 
     describe 'Integrating client projects' do
       it 'integrates the client projects' do
-        @installer.stubs(:aggregate_targets).returns([AggregateTarget.new(nil, config.sandbox)])
+        @installer.stubs(:aggregate_targets).returns([AggregateTarget.new(fixture_target_definition, config.sandbox)])
         Installer::UserProjectIntegrator.any_instance.expects(:integrate!)
         @installer.send(:integrate_user_project)
       end
@@ -836,8 +672,8 @@ module Pod
         podfile = Pod::Podfile.new do
           platform :ios
         end
-        config.integrate_targets = false
         @installer = Installer.new(config.sandbox, podfile)
+        @installer.installation_options.integrate_targets = false
       end
 
       it 'runs the pre install hooks' do

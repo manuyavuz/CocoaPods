@@ -2,10 +2,12 @@ module Pod
   # Model class which describes a Pods target.
   #
   # The Target class stores and provides the information necessary for
-  # working with a target in the Podfile and it's dependent libraries.
+  # working with a target in the Podfile and its dependent libraries.
   # This class is used to represent both the targets and their libraries.
   #
   class Target
+    DEFAULT_VERSION = '1.0.0'.freeze
+
     # @return [Sandbox] The sandbox where the Pods should be installed.
     #
     attr_reader :sandbox
@@ -72,7 +74,7 @@ module Pod
     #         #requires_frameworks?.
     #
     def product_type
-      requires_frameworks? ? :framework : :static_library
+      requires_frameworks? && !static_framework? ? :framework : :static_library
     end
 
     # @return [String] A string suitable for debugging.
@@ -88,6 +90,12 @@ module Pod
     #
     def requires_frameworks?
       host_requires_frameworks? || false
+    end
+
+    # @return [Boolean] Whether the target should build a static framework.
+    #
+    def static_framework?
+      !is_a?(Pod::AggregateTarget) && specs.any? && specs.flat_map(&:root).all?(&:static_framework)
     end
 
     #-------------------------------------------------------------------------#
@@ -150,12 +158,6 @@ module Pod
       support_files_dir + "#{label}.modulemap"
     end
 
-    # @return [Pathname] the absolute path of the prefix header file.
-    #
-    def prefix_header_path
-      support_files_dir + "#{label}-prefix.pch"
-    end
-
     # @return [Pathname] the absolute path of the bridge support file.
     #
     def bridge_support_path
@@ -172,6 +174,12 @@ module Pod
     #
     def dummy_source_path
       support_files_dir + "#{label}-dummy.m"
+    end
+
+    # @return [String] The version associated with this target
+    #
+    def version
+      DEFAULT_VERSION
     end
 
     #-------------------------------------------------------------------------#

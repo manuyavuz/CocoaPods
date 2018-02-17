@@ -1,7 +1,11 @@
+require 'active_support/core_ext/array/conversions'
+
 module Pod
   class Installer
     class Analyzer
       class TargetInspector
+        PLATFORM_INFO_URL = 'https://guides.cocoapods.org/syntax/podfile.html#platform'.freeze
+
         # @return [TargetDefinition] the target definition to inspect
         #
         attr_accessor :target_definition
@@ -42,6 +46,7 @@ module Pod
           result.platform = compute_platform(targets)
           result.archs = compute_archs(targets)
           result.project = user_project
+          result.target_definition.swift_version = compute_swift_version_from_targets(targets)
           result
         end
 
@@ -70,7 +75,7 @@ module Pod
             else
               raise Informative, 'Could not automatically select an Xcode project. ' \
                 "Specify one in your Podfile like so:\n\n" \
-                "    xcodeproj 'path/to/Project.xcodeproj'\n"
+                "    project 'path/to/Project.xcodeproj'\n"
             end
           end
           path
@@ -102,19 +107,12 @@ module Pod
         #
         def compute_targets(user_project)
           native_targets = user_project.native_targets
-          if link_with = target_definition.link_with
-            targets = native_targets.select { |t| link_with.include?(t.name) }
-            raise Informative, "Unable to find the targets named #{link_with.map { |x| "`#{x}`" }.to_sentence}" \
-              "to link with target definition `#{target_definition.name}`" if targets.empty?
-          elsif target_definition.link_with_first_target?
-            targets = [native_targets.first].compact
-            raise Informative, 'Unable to find a target' if targets.empty?
-          else
-            target = native_targets.find { |t| t.name == target_definition.name.to_s }
-            targets = [target].compact
-            raise Informative, "Unable to find a target named `#{target_definition.name}`" if targets.empty?
+          target = native_targets.find { |t| t.name == target_definition.name.to_s }
+          unless target
+            found = native_targets.map { |t| "`#{t.name}`" }.to_sentence
+            raise Informative, "Unable to find a target named `#{target_definition.name}`, did find #{found}."
           end
-          targets
+          [target]
         end
 
         # @param  [Array<PBXNativeTarget] the user's targets of the project of
@@ -157,6 +155,15 @@ module Pod
               deployment_target = Version.new(target.deployment_target)
             end
           end
+
+          unless name
+            raise Informative,
+                  "Unable to determine the platform for the `#{target_definition.name}` target."
+          end
+
+          UI.warn "Automatically assigning platform `#{name}` with version `#{deployment_target}` " \
+            "on target `#{target_definition.name}` because no platform was specified. " \
+            "Please specify a platform for this target in your Podfile. See `#{PLATFORM_INFO_URL}`."
 
           target_definition.set_platform(name, deployment_target)
           Platform.new(name, deployment_target)
@@ -203,6 +210,46 @@ module Pod
             target.source_build_phase.files.any? do |build_file|
               file_predicate.call(build_file.file_ref)
             end
+          end
+        end
+
+        # Compute the Swift version for the target build configurations. If more
+        # than one Swift version is defined for a given target, then it will raise.
+        #
+        # @param  [Array<PBXNativeTarget>] targets
+        #         the targets that are checked for Swift versions.
+        #
+        # @return [String] the targets Swift version or nil
+        #
+        def compute_swift_version_from_targets(targets)
+          versions_to_targets = targets.inject({}) do |memo, target|
+            versions = target.resolved_build_setting('SWIFT_VERSION').values
+            versions.each do |version|
+              memo[version] = [] if memo[version].nil?
+              memo[version] << target.name unless memo[version].include? target.name
+            end
+            memo
+          end
+
+          case versions_to_targets.count
+          when 0
+            nil
+          when 1
+            versions_to_targets.keys.first
+          else
+            target_version_pairs = versions_to_targets.map do |version_names, target_names|
+              target_names.map { |target_name| [target_name, version_names] }
+            end
+
+            sorted_pairs = target_version_pairs.flat_map { |i| i }.sort_by do |target_name, version_name|
+              "#{target_name} #{version_name}"
+            end
+
+            formatted_output = sorted_pairs.map do |target, version_name|
+              "#{target}: Swift #{version_name}"
+            end.join("\n")
+
+            raise Informative, "There may only be up to 1 unique SWIFT_VERSION per target. Found target(s) with multiple Swift versions:\n#{formatted_output}"
           end
         end
       end

@@ -5,16 +5,17 @@ module Pod
     before do
       spec = fixture_spec('banana-lib/BananaLib.podspec')
       @target_definition = Podfile::TargetDefinition.new('Pods', nil)
+      @target_definition.abstract = false
       @pod_target = PodTarget.new([spec], [@target_definition], config.sandbox)
-      @pod_target.stubs(:platform).returns(:ios)
+      @pod_target.stubs(:platform).returns(Platform.ios)
     end
 
     describe 'Meta' do
-      describe '#scoped' do
+      describe '#scope_suffix' do
         it 'returns target copies per target definition, which are scoped' do
-          @pod_target.should.not.be.scoped
-          @pod_target.scoped.first.should.be.scoped
-          @pod_target.should.not.be.scoped
+          @pod_target.scope_suffix.should.be.nil
+          @pod_target.scoped.first.scope_suffix.should == 'Pods'
+          @pod_target.scope_suffix.should.be.nil
         end
       end
     end
@@ -30,17 +31,24 @@ module Pod
 
       it 'returns its name' do
         @pod_target.name.should == 'BananaLib'
-        @pod_target.scoped.first.name.should == 'Pods-BananaLib'
+        @pod_target.scoped.first.name.should == 'BananaLib-Pods'
       end
 
       it 'returns its label' do
         @pod_target.label.should == 'BananaLib'
-        @pod_target.scoped.first.label.should == 'Pods-BananaLib'
+        @pod_target.scoped.first.label.should == 'BananaLib-Pods'
+      end
+
+      it 'returns its label' do
+        @pod_target.label.should == 'BananaLib'
+        @pod_target.scoped.first.label.should == 'BananaLib-Pods'
+        spec_scoped_pod_target = @pod_target.scoped.first.tap { |t| t.stubs(:scope_suffix).returns('.default-GreenBanana') }
+        spec_scoped_pod_target.label.should == 'BananaLib.default-GreenBanana'
       end
 
       it 'returns the name of its product' do
         @pod_target.product_name.should == 'libBananaLib.a'
-        @pod_target.scoped.first.product_name.should == 'libPods-BananaLib.a'
+        @pod_target.scoped.first.product_name.should == 'libBananaLib-Pods.a'
       end
 
       it 'returns the spec consumers for the pod targets' do
@@ -57,7 +65,7 @@ module Pod
 
       it 'returns the name of the resources bundle target' do
         @pod_target.resources_bundle_target_label('Fruits').should == 'BananaLib-Fruits'
-        @pod_target.scoped.first.resources_bundle_target_label('Fruits').should == 'Pods-BananaLib-Fruits'
+        @pod_target.scoped.first.resources_bundle_target_label('Fruits').should == 'BananaLib-Pods-Fruits'
       end
 
       it 'returns the name of the Pods on which this target depends' do
@@ -101,6 +109,53 @@ module Pod
 
         @pod_target.should_build?.should == false
       end
+
+      it 'builds a pod target if there are no actual source files but there are script phases' do
+        fa = Sandbox::FileAccessor.new(nil, @pod_target)
+        fa.stubs(:source_files).returns([Pathname.new('foo.h')])
+        @pod_target.stubs(:file_accessors).returns([fa])
+        @pod_target.root_spec.script_phase = { :name => 'Hello World', :script => 'echo "Hello World"' }
+
+        @pod_target.should_build?.should == true
+      end
+    end
+
+    describe 'target version' do
+      it 'handles when the version is more than 3 numeric parts' do
+        version = Version.new('0.2.0.1')
+        @pod_target.root_spec.stubs(:version).returns(version)
+        @pod_target.version.should == '0.2.0'
+      end
+
+      it 'handles when the version is less than 3 numeric parts' do
+        version = Version.new('0.2')
+        @pod_target.root_spec.stubs(:version).returns(version)
+        @pod_target.version.should == '0.2.0'
+      end
+
+      it 'handles when the version is a pre-release' do
+        version = Version.new('1.0.0-beta.1')
+        @pod_target.root_spec.stubs(:version).returns(version)
+        @pod_target.version.should == '1.0.0'
+
+        version = Version.new('1.0-beta.5')
+        @pod_target.root_spec.stubs(:version).returns(version)
+        @pod_target.version.should == '1.0.0'
+      end
+    end
+
+    describe 'swift version' do
+      it 'uses the swift version defined in the specification' do
+        @pod_target.root_spec.stubs(:swift_version).returns('3.0')
+        @target_definition.stubs(:swift_version).returns('2.3')
+        @pod_target.swift_version.should == '3.0'
+      end
+
+      it 'uses the swift version defined by the target definitions if no swift version is specifed in the spec' do
+        @pod_target.root_spec.stubs(:swift_version).returns(nil)
+        @target_definition.stubs(:swift_version).returns('2.3')
+        @pod_target.swift_version.should == '2.3'
+      end
     end
 
     describe 'Support files' do
@@ -109,7 +164,7 @@ module Pod
           'Pods/Target Support Files/BananaLib/BananaLib.release.xcconfig',
         )
         @pod_target.scoped.first.xcconfig_path('Release').to_s.should.include?(
-          'Pods/Target Support Files/Pods-BananaLib/Pods-BananaLib.release.xcconfig',
+          'Pods/Target Support Files/BananaLib-Pods/BananaLib-Pods.release.xcconfig',
         )
       end
 
@@ -118,7 +173,7 @@ module Pod
           'Pods/Target Support Files/BananaLib/BananaLib.release-1.xcconfig',
         )
         @pod_target.scoped.first.xcconfig_path("Release#{File::SEPARATOR}1").to_s.should.include?(
-          'Pods/Target Support Files/Pods-BananaLib/Pods-BananaLib.release-1.xcconfig',
+          'Pods/Target Support Files/BananaLib-Pods/BananaLib-Pods.release-1.xcconfig',
         )
       end
 
@@ -127,7 +182,7 @@ module Pod
           'Pods/Target Support Files/BananaLib/BananaLib-prefix.pch',
         )
         @pod_target.scoped.first.prefix_header_path.to_s.should.include?(
-          'Pods/Target Support Files/Pods-BananaLib/Pods-BananaLib-prefix.pch',
+          'Pods/Target Support Files/BananaLib-Pods/BananaLib-Pods-prefix.pch',
         )
       end
 
@@ -142,7 +197,7 @@ module Pod
           'Pods/Target Support Files/BananaLib/Info.plist',
         )
         @pod_target.scoped.first.info_plist_path.to_s.should.include?(
-          'Pods/Target Support Files/Pods-BananaLib/Info.plist',
+          'Pods/Target Support Files/BananaLib-Pods/Info.plist',
         )
       end
 
@@ -151,7 +206,7 @@ module Pod
           'Pods/Target Support Files/BananaLib/BananaLib-dummy.m',
         )
         @pod_target.scoped.first.dummy_source_path.to_s.should.include?(
-          'Pods/Target Support Files/Pods-BananaLib/Pods-BananaLib-dummy.m',
+          'Pods/Target Support Files/BananaLib-Pods/BananaLib-Pods-dummy.m',
         )
       end
 
@@ -162,8 +217,130 @@ module Pod
       end
 
       it 'returns the path for the CONFIGURATION_BUILD_DIR build setting' do
-        @pod_target.configuration_build_dir.should == '$(BUILD_DIR)/$(CONFIGURATION)$(EFFECTIVE_PLATFORM_NAME)'
-        @pod_target.scoped.first.configuration_build_dir.should == '$(BUILD_DIR)/$(CONFIGURATION)$(EFFECTIVE_PLATFORM_NAME)/Pods'
+        @pod_target.configuration_build_dir.should == '${PODS_CONFIGURATION_BUILD_DIR}/BananaLib'
+        @pod_target.scoped.first.configuration_build_dir.should == '${PODS_CONFIGURATION_BUILD_DIR}/BananaLib-Pods'
+        @pod_target.configuration_build_dir('${PODS_BUILD_DIR}').should == '${PODS_BUILD_DIR}/BananaLib'
+        @pod_target.scoped.first.configuration_build_dir('${PODS_BUILD_DIR}').should == '${PODS_BUILD_DIR}/BananaLib-Pods'
+      end
+
+      it 'returns the path for the CONFIGURATION_BUILD_DIR build setting' do
+        @pod_target.build_product_path.should == '${PODS_CONFIGURATION_BUILD_DIR}/BananaLib/libBananaLib.a'
+        @pod_target.scoped.first.build_product_path.should == '${PODS_CONFIGURATION_BUILD_DIR}/BananaLib-Pods/libBananaLib-Pods.a'
+        @pod_target.build_product_path('$BUILT_PRODUCTS_DIR').should == '$BUILT_PRODUCTS_DIR/BananaLib/libBananaLib.a'
+        @pod_target.scoped.first.build_product_path('$BUILT_PRODUCTS_DIR').should == '$BUILT_PRODUCTS_DIR/BananaLib-Pods/libBananaLib-Pods.a'
+      end
+
+      it 'returns prefix header path' do
+        @pod_target.prefix_header_path.to_s.should.include 'Pods/Target Support Files/BananaLib/BananaLib-prefix.pch'
+      end
+
+      describe 'non modular header search paths' do
+        it 'returns the correct search paths' do
+          @pod_target.build_headers.add_search_path('BananaLib', Platform.ios)
+          @pod_target.sandbox.public_headers.add_search_path('BananaLib', Platform.ios)
+          header_search_paths = @pod_target.header_search_paths
+          header_search_paths.sort.should == [
+            '${PODS_ROOT}/Headers/Private/BananaLib',
+            '${PODS_ROOT}/Headers/Public/BananaLib',
+            '${PODS_ROOT}/Headers/Public/BananaLib/BananaLib',
+          ]
+        end
+
+        it 'returns the correct header search paths recursively for dependent targets' do
+          @pod_target.build_headers.add_search_path('BananaLib', Platform.ios)
+          @pod_target.sandbox.public_headers.add_search_path('BananaLib', Platform.ios)
+          @pod_target.sandbox.public_headers.add_search_path('monkey', Platform.ios)
+          monkey_spec = fixture_spec('monkey/monkey.podspec')
+          monkey_pod_target = PodTarget.new([monkey_spec], [@target_definition], config.sandbox)
+          monkey_pod_target.stubs(:platform).returns(Platform.ios)
+          @pod_target.stubs(:dependent_targets).returns([monkey_pod_target])
+          header_search_paths = @pod_target.header_search_paths
+          header_search_paths.sort.should == [
+            '${PODS_ROOT}/Headers/Private/BananaLib',
+            '${PODS_ROOT}/Headers/Public/BananaLib',
+            '${PODS_ROOT}/Headers/Public/BananaLib/BananaLib',
+            '${PODS_ROOT}/Headers/Public/monkey',
+            '${PODS_ROOT}/Headers/Public/monkey/monkey',
+          ]
+        end
+
+        it 'returns the correct header search paths recursively for dependent targets excluding platform' do
+          @pod_target.build_headers.add_search_path('BananaLib', Platform.ios)
+          @pod_target.sandbox.public_headers.add_search_path('BananaLib', Platform.ios)
+          @pod_target.sandbox.public_headers.add_search_path('monkey', Platform.osx)
+          monkey_spec = fixture_spec('monkey/monkey.podspec')
+          monkey_pod_target = PodTarget.new([monkey_spec], [@target_definition], config.sandbox)
+          monkey_pod_target.stubs(:platform).returns(Platform.ios)
+          @pod_target.stubs(:dependent_targets).returns([monkey_pod_target])
+          header_search_paths = @pod_target.header_search_paths
+          # The monkey lib header search paths should not be present since they are only present in OSX.
+          header_search_paths.sort.should == [
+            '${PODS_ROOT}/Headers/Private/BananaLib',
+            '${PODS_ROOT}/Headers/Public/BananaLib',
+            '${PODS_ROOT}/Headers/Public/BananaLib/BananaLib',
+          ]
+        end
+      end
+
+      describe 'modular header search paths' do
+        before do
+          @pod_target.stubs(:defines_module?).returns(true)
+        end
+
+        it 'uses modular header search paths when specified in the podfile' do
+          @pod_target.unstub(:defines_module?)
+          @pod_target.target_definitions.first.stubs(:build_pod_as_module?).with('BananaLib').returns(true)
+
+          @pod_target.build_headers.add_search_path('BananaLib', Platform.ios)
+          @pod_target.sandbox.public_headers.add_search_path('BananaLib', Platform.ios)
+          header_search_paths = @pod_target.header_search_paths
+          header_search_paths.sort.should == [
+            '${PODS_ROOT}/Headers/Private/BananaLib',
+            '${PODS_ROOT}/Headers/Public/BananaLib',
+          ]
+        end
+
+        it 'returns the correct header search paths' do
+          @pod_target.build_headers.add_search_path('BananaLib', Platform.ios)
+          @pod_target.sandbox.public_headers.add_search_path('BananaLib', Platform.ios)
+          header_search_paths = @pod_target.header_search_paths
+          header_search_paths.sort.should == [
+            '${PODS_ROOT}/Headers/Private/BananaLib',
+            '${PODS_ROOT}/Headers/Public/BananaLib',
+          ]
+        end
+
+        it 'returns the correct header search paths recursively for dependent targets' do
+          @pod_target.build_headers.add_search_path('BananaLib', Platform.ios)
+          @pod_target.sandbox.public_headers.add_search_path('BananaLib', Platform.ios)
+          @pod_target.sandbox.public_headers.add_search_path('monkey', Platform.ios)
+          monkey_spec = fixture_spec('monkey/monkey.podspec')
+          monkey_pod_target = PodTarget.new([monkey_spec], [@target_definition], config.sandbox)
+          monkey_pod_target.stubs(:platform).returns(Platform.ios)
+          @pod_target.stubs(:dependent_targets).returns([monkey_pod_target])
+          header_search_paths = @pod_target.header_search_paths
+          header_search_paths.sort.should == [
+            '${PODS_ROOT}/Headers/Private/BananaLib',
+            '${PODS_ROOT}/Headers/Public/BananaLib',
+            '${PODS_ROOT}/Headers/Public/monkey',
+          ]
+        end
+
+        it 'returns the correct header search paths recursively for dependent targets excluding platform' do
+          @pod_target.build_headers.add_search_path('BananaLib', Platform.ios)
+          @pod_target.sandbox.public_headers.add_search_path('BananaLib', Platform.ios)
+          @pod_target.sandbox.public_headers.add_search_path('monkey', Platform.osx)
+          monkey_spec = fixture_spec('monkey/monkey.podspec')
+          monkey_pod_target = PodTarget.new([monkey_spec], [@target_definition], config.sandbox)
+          monkey_pod_target.stubs(:platform).returns(Platform.ios)
+          @pod_target.stubs(:dependent_targets).returns([monkey_pod_target])
+          header_search_paths = @pod_target.header_search_paths
+          # The monkey lib header search paths should not be present since they are only present in OSX.
+          header_search_paths.sort.should == [
+            '${PODS_ROOT}/Headers/Private/BananaLib',
+            '${PODS_ROOT}/Headers/Public/BananaLib',
+          ]
+        end
       end
     end
 
@@ -192,7 +369,7 @@ module Pod
 
           it 'returns the library name' do
             @pod_target.static_library_name.should == 'libBananaLib.a'
-            @pod_target.scoped.first.static_library_name.should == 'libPods-BananaLib.a'
+            @pod_target.scoped.first.static_library_name.should == 'libBananaLib-Pods.a'
           end
 
           it 'returns :framework as product type' do
@@ -202,12 +379,16 @@ module Pod
           it 'returns that it requires being built as framework' do
             @pod_target.requires_frameworks?.should == true
           end
+
+          it 'returns that it has no test specifications' do
+            @pod_target.contains_test_specifications?.should == false
+          end
         end
 
         describe 'Host does not requires frameworks' do
           it 'returns the product name' do
             @pod_target.product_name.should == 'libBananaLib.a'
-            @pod_target.scoped.first.product_name.should == 'libPods-BananaLib.a'
+            @pod_target.scoped.first.product_name.should == 'libBananaLib-Pods.a'
           end
 
           it 'returns the framework name' do
@@ -216,7 +397,7 @@ module Pod
 
           it 'returns the library name' do
             @pod_target.static_library_name.should == 'libBananaLib.a'
-            @pod_target.scoped.first.static_library_name.should == 'libPods-BananaLib.a'
+            @pod_target.scoped.first.static_library_name.should == 'libBananaLib-Pods.a'
           end
 
           it 'returns :static_library as product type' do
@@ -253,7 +434,7 @@ module Pod
 
         it 'returns the library name' do
           @pod_target.static_library_name.should == 'libOrangeFramework.a'
-          @pod_target.scoped.first.static_library_name.should == 'libPods-OrangeFramework.a'
+          @pod_target.scoped.first.static_library_name.should == 'libOrangeFramework-Pods.a'
         end
 
         it 'returns :framework as product type' do
@@ -262,6 +443,183 @@ module Pod
 
         it 'returns that it requires being built as framework' do
           @pod_target.requires_frameworks?.should == true
+        end
+      end
+
+      describe 'With dependencies' do
+        before do
+          @pod_dependency = fixture_pod_target('orange-framework/OrangeFramework.podspec')
+          @pod_target.dependent_targets = [@pod_dependency]
+        end
+
+        it 'resolves simple dependencies' do
+          @pod_target.recursive_dependent_targets.should == [@pod_dependency]
+        end
+
+        describe 'With cyclic dependencies' do
+          before do
+            @pod_dependency = fixture_pod_target('orange-framework/OrangeFramework.podspec')
+            @pod_dependency.dependent_targets = [@pod_target]
+            @pod_target.dependent_targets = [@pod_dependency]
+          end
+
+          it 'resolves the cycle' do
+            @pod_target.recursive_dependent_targets.should == [@pod_dependency]
+          end
+        end
+      end
+
+      describe 'script phases support' do
+        before do
+          @pod_target = fixture_pod_target('coconut-lib/CoconutLib.podspec')
+        end
+
+        it 'returns false if it does not contain test specifications' do
+          @pod_target.contains_script_phases?.should == false
+        end
+
+        it 'returns true if it contains test specifications' do
+          @pod_target.root_spec.script_phase = { :name => 'Hello World', :script => 'echo "Hello World"' }
+          @pod_target.contains_script_phases?.should == true
+        end
+      end
+
+      describe 'test spec support' do
+        before do
+          @coconut_spec = fixture_spec('coconut-lib/CoconutLib.podspec')
+          @test_spec_target_definition = Podfile::TargetDefinition.new('Pods', nil)
+          @test_spec_target_definition.abstract = false
+          @test_pod_target = PodTarget.new([@coconut_spec, *@coconut_spec.recursive_subspecs], [@test_spec_target_definition], config.sandbox)
+          @test_pod_target.stubs(:platform).returns(Platform.new(:ios, '6.0'))
+        end
+
+        it 'returns that it has test specifications' do
+          @test_pod_target.contains_test_specifications?.should == true
+        end
+
+        it 'returns supported test types' do
+          @test_pod_target.supported_test_types.should == [:unit]
+        end
+
+        it 'returns test label based on test type' do
+          @test_pod_target.test_target_label(:unit).should == 'CoconutLib-Unit-Tests'
+        end
+
+        it 'returns app host label based on test type' do
+          @test_pod_target.app_host_label(:unit).should == 'AppHost-iOS-Unit-Tests'
+        end
+
+        it 'returns the correct native target based on the consumer provided' do
+          @test_pod_target.stubs(:native_target).returns(stub(:name => 'CoconutLib', :symbol_type => :dynamic_library, :product_reference => stub(:name => 'libCoconutLib.a')))
+          @test_pod_target.stubs(:test_native_targets).returns([stub(:name => 'CoconutLib-Unit-Tests', :symbol_type => :unit_test_bundle, :product_reference => stub(:name => 'CoconutLib-Unit-Tests'))])
+          native_target = @test_pod_target.native_target_for_spec(@coconut_spec)
+          native_target.name.should == 'CoconutLib'
+          native_target.product_reference.name.should == 'libCoconutLib.a'
+          test_native_target = @test_pod_target.native_target_for_spec(@coconut_spec.test_specs.first)
+          test_native_target.name.should == 'CoconutLib-Unit-Tests'
+          test_native_target.product_reference.name.should == 'CoconutLib-Unit-Tests'
+        end
+
+        it 'returns the correct product type for test type' do
+          @test_pod_target.product_type_for_test_type(:unit).should == :unit_test_bundle
+        end
+
+        it 'raises for unknown test type' do
+          exception = lambda { @test_pod_target.product_type_for_test_type(:weird_test_type) }.should.raise Informative
+          exception.message.should.include 'Unknown test type `weird_test_type`.'
+        end
+
+        it 'returns the correct test type for product type' do
+          @test_pod_target.test_type_for_product_type(:unit_test_bundle).should == :unit
+        end
+
+        it 'raises for unknown product type' do
+          exception = lambda { @test_pod_target.test_type_for_product_type(:weird_product_type) }.should.raise Informative
+          exception.message.should.include 'Unknown product type `weird_product_type`'
+        end
+
+        it 'returns correct copy resources script path for test unit test type' do
+          @test_pod_target.copy_resources_script_path_for_test_type(:unit).to_s.should.include 'Pods/Target Support Files/CoconutLib/CoconutLib-Unit-Tests-resources.sh'
+        end
+
+        it 'returns correct embed frameworks script path for test unit test type' do
+          @test_pod_target.embed_frameworks_script_path_for_test_type(:unit).to_s.should.include 'Pods/Target Support Files/CoconutLib/CoconutLib-Unit-Tests-frameworks.sh'
+        end
+
+        it 'returns correct prefix header path for test unit test type' do
+          @test_pod_target.prefix_header_path_for_test_type(:unit).to_s.should.include 'Pods/Target Support Files/CoconutLib/CoconutLib-Unit-Tests-prefix.pch'
+        end
+
+        it 'returns the correct resource path for test resource bundles' do
+          fa = Sandbox::FileAccessor.new(nil, @test_pod_target)
+          fa.stubs(:resource_bundles).returns('TestResourceBundle' => [Pathname.new('Model.xcdatamodeld')])
+          fa.stubs(:resources).returns([])
+          fa.stubs(:spec).returns(stub(:test_specification? => true))
+          @test_pod_target.stubs(:file_accessors).returns([fa])
+          @test_pod_target.resource_paths.should == ['${PODS_CONFIGURATION_BUILD_DIR}/TestResourceBundle.bundle']
+        end
+
+        it 'includes framework paths from test specifications' do
+          fa = Sandbox::FileAccessor.new(nil, @test_pod_target)
+          fa.stubs(:vendored_dynamic_artifacts).returns([config.sandbox.root + Pathname.new('Vendored/Vendored.framework')])
+          fa.stubs(:spec).returns(stub(:test_specification? => false))
+          test_fa = Sandbox::FileAccessor.new(nil, @test_pod_target)
+          test_fa.stubs(:vendored_dynamic_artifacts).returns([config.sandbox.root + Pathname.new('Vendored/TestVendored.framework')])
+          test_fa.stubs(:spec).returns(stub(:test_specification? => true))
+          @test_pod_target.stubs(:file_accessors).returns([fa, test_fa])
+          @test_pod_target.stubs(:should_build?).returns(true)
+          @test_pod_target.framework_paths.should == [
+            { :name => 'Vendored.framework',
+              :input_path => '${PODS_ROOT}/Vendored/Vendored.framework',
+              :output_path => '${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/Vendored.framework' },
+            { :name => 'TestVendored.framework',
+              :input_path => '${PODS_ROOT}/Vendored/TestVendored.framework',
+              :output_path => '${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/TestVendored.framework' },
+          ]
+        end
+
+        it 'excludes framework paths from test specifications when not requested' do
+          fa = Sandbox::FileAccessor.new(nil, @test_pod_target)
+          fa.stubs(:vendored_dynamic_artifacts).returns([config.sandbox.root + Pathname.new('Vendored/Vendored.framework')])
+          fa.stubs(:spec).returns(stub(:test_specification? => false))
+          test_fa = Sandbox::FileAccessor.new(nil, @test_pod_target)
+          test_fa.stubs(:vendored_dynamic_artifacts).returns([config.sandbox.root + Pathname.new('Vendored/TestVendored.framework')])
+          test_fa.stubs(:spec).returns(stub(:test_specification? => true))
+          @test_pod_target.stubs(:file_accessors).returns([fa, test_fa])
+          @test_pod_target.stubs(:should_build?).returns(true)
+          @test_pod_target.framework_paths(false).should == [
+            { :name => 'Vendored.framework',
+              :input_path => '${PODS_ROOT}/Vendored/Vendored.framework',
+              :output_path => '${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/Vendored.framework' },
+          ]
+        end
+
+        it 'includes resource paths from test specifications' do
+          config.sandbox.stubs(:project => stub(:path => Pathname.new('ProjectPath')))
+          fa = Sandbox::FileAccessor.new(nil, @test_pod_target)
+          fa.stubs(:resource_bundles).returns({})
+          fa.stubs(:resources).returns([Pathname.new('Model.xcdatamodeld')])
+          fa.stubs(:spec).returns(stub(:test_specification? => false))
+          test_fa = Sandbox::FileAccessor.new(nil, @test_pod_target)
+          test_fa.stubs(:resource_bundles).returns({})
+          test_fa.stubs(:resources).returns([Pathname.new('TestModel.xcdatamodeld')])
+          test_fa.stubs(:spec).returns(stub(:test_specification? => true))
+          @test_pod_target.stubs(:file_accessors).returns([fa, test_fa])
+          @test_pod_target.resource_paths.should == ['${PODS_ROOT}/Model.xcdatamodeld', '${PODS_ROOT}/TestModel.xcdatamodeld']
+        end
+
+        it 'excludes resource paths from test specifications when not requested' do
+          config.sandbox.stubs(:project => stub(:path => Pathname.new('ProjectPath')))
+          fa = Sandbox::FileAccessor.new(nil, @test_pod_target)
+          fa.stubs(:resource_bundles).returns({})
+          fa.stubs(:resources).returns([Pathname.new('Model.xcdatamodeld')])
+          fa.stubs(:spec).returns(stub(:test_specification? => false))
+          test_fa = Sandbox::FileAccessor.new(nil, @test_pod_target)
+          test_fa.stubs(:resource_bundles).returns({})
+          test_fa.stubs(:resources).returns([Pathname.new('TestModel.xcdatamodeld')])
+          test_fa.stubs(:spec).returns(stub(:test_specification? => true))
+          @test_pod_target.stubs(:file_accessors).returns([fa, test_fa])
+          @test_pod_target.resource_paths(false).should == ['${PODS_ROOT}/Model.xcdatamodeld']
         end
       end
     end

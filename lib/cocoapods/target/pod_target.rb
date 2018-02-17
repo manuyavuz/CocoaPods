@@ -7,7 +7,7 @@ module Pod
     #
     attr_reader :specs
 
-    # @return [Array<PBXNativeTarget>] the target definitions of the Podfile
+    # @return [Array<TargetDefinition>] the target definitions of the Podfile
     #         that generated this target.
     #
     attr_reader :target_definitions
@@ -16,45 +16,52 @@ module Pod
     #
     attr_reader :build_headers
 
-    # @return [Bool] whether the target needs to be scoped by target definition,
-    #         because the spec is used with different subspec sets across them.
+    # @return [String] used as suffix in the label
     #
-    # @note   For frameworks the target products of {PodTarget}s are named
-    #         after their specs. The namespacing cannot directly happen in
-    #         the product name itself, because this must be equal to the module
-    #         name and this will be used in source code, which should stay
-    #         agnostic over the dependency manager.
-    #         We need namespacing because multiple targets can exist for the
-    #         same podspec and their products should not collide. This
-    #         duplication is needed when multiple user targets have the same
-    #         dependency, but they require different sets of subspecs or they
-    #         are on different platforms.
+    # @note This affects the value returned by #configuration_build_dir
+    #       and accessors relying on this as #build_product_path.
     #
-    attr_reader :scoped
-    alias_method :scoped?, :scoped
+    attr_reader :scope_suffix
 
     # @return [Array<PodTarget>] the targets that this target has a dependency
     #         upon.
     #
     attr_accessor :dependent_targets
 
-    # @param [Array<Specification>] @spec #see spec
-    # @param [Array<TargetDefinition>] target_definitions @see target_definitions
-    # @param [Sandbox] sandbox @see sandbox
-    # @param [Bool] scoped @see scoped
+    # @return [Array<PodTarget>] the targets that this target has a test dependency
+    #         upon.
     #
-    def initialize(specs, target_definitions, sandbox, scoped = false)
+    attr_accessor :test_dependent_targets
+
+    # return [Array<PBXNativeTarget>] the test target generated in the Pods project for
+    #         this library or `nil` if there is no test target created.
+    #
+    attr_accessor :test_native_targets
+
+    # @param [Array<Specification>] specs @see #specs
+    # @param [Array<TargetDefinition>] target_definitions @see #target_definitions
+    # @param [Sandbox] sandbox @see #sandbox
+    # @param [String] scope_suffix @see #scope_suffix
+    #
+    def initialize(specs, target_definitions, sandbox, scope_suffix = nil)
       raise "Can't initialize a PodTarget without specs!" if specs.nil? || specs.empty?
       raise "Can't initialize a PodTarget without TargetDefinition!" if target_definitions.nil? || target_definitions.empty?
+      raise "Can't initialize a PodTarget with only abstract TargetDefinitions" if target_definitions.all?(&:abstract?)
+      raise "Can't initialize a PodTarget with an empty string scope suffix!" if scope_suffix == ''
       super()
-      @specs = specs
+      @specs = specs.dup.freeze
+      @test_specs, @non_test_specs = @specs.partition(&:test_specification?)
       @target_definitions = target_definitions
       @sandbox = sandbox
-      @scoped = scoped
-      @build_headers  = Sandbox::HeadersStore.new(sandbox, 'Private')
+      @scope_suffix = scope_suffix
+      @build_headers  = Sandbox::HeadersStore.new(sandbox, 'Private', :private)
       @file_accessors = []
       @resource_bundle_targets = []
+      @test_resource_bundle_targets = []
+      @test_native_targets = []
       @dependent_targets = []
+      @test_dependent_targets = []
+      @build_config_cache = {}
     end
 
     # @param [Hash{Array => PodTarget}] cache
@@ -67,12 +74,13 @@ module Pod
         if cache[cache_key]
           cache[cache_key]
         else
-          target = PodTarget.new(specs, [target_definition], sandbox, true)
+          target = PodTarget.new(specs, [target_definition], sandbox, target_definition.label)
           target.file_accessors = file_accessors
           target.user_build_configurations = user_build_configurations
           target.native_target = native_target
           target.archs = archs
           target.dependent_targets = dependent_targets.flat_map { |pt| pt.scoped(cache) }.select { |pt| pt.target_definitions == [target_definition] }
+          target.host_requires_frameworks = host_requires_frameworks
           cache[cache_key] = target
         end
       end
@@ -81,18 +89,52 @@ module Pod
     # @return [String] the label for the target.
     #
     def label
-      if scoped?
-        "#{target_definitions.first.label}-#{root_spec.name}"
+      if scope_suffix.nil? || scope_suffix[0] == '.'
+        "#{root_spec.name}#{scope_suffix}"
       else
-        root_spec.name
+        "#{root_spec.name}-#{scope_suffix}"
       end
     end
 
+    # @return [String] the Swift version for the target. If the pod author has provided a swift version
+    #                  then that is the one returned, otherwise the Swift version is determined by the user
+    #                  targets that include this pod target.
+    #
+    def swift_version
+      spec_swift_version || target_definitions.map(&:swift_version).compact.uniq.first
+    end
+
+    # @return [String] the Swift version within the root spec. Might be `nil` if none is set.
+    #
+    def spec_swift_version
+      root_spec.swift_version
+    end
+
+    # @note   The deployment target for the pod target is the maximum of all
+    #         the deployment targets for the current platform of the target
+    #         (or the minimum required to support the current installation
+    #         strategy, if higher).
+    #
     # @return [Platform] the platform for this target.
     #
     def platform
-      @platform ||= target_definitions.first.platform
+      @platform ||= begin
+        platform_name = target_definitions.first.platform.name
+        default = Podfile::TargetDefinition::PLATFORM_DEFAULTS[platform_name]
+        deployment_target = specs.map do |spec|
+          Version.new(spec.deployment_target(platform_name) || default)
+        end.max
+        if platform_name == :ios && requires_frameworks?
+          minimum = Version.new('8.0')
+          deployment_target = [deployment_target, minimum].max
+        end
+        Platform.new(platform_name, deployment_target)
+      end
     end
+
+    # @visibility private
+    #
+    attr_writer :platform
 
     # @return [Podfile] The podfile which declares the dependency.
     #
@@ -113,18 +155,26 @@ module Pod
     #
     attr_accessor :file_accessors
 
-    # @return [Array<PBXTarget>] the resource bundle targets belonging
+    # @return [Array<PBXNativeTarget>] the resource bundle targets belonging
     #         to this target.
     attr_reader :resource_bundle_targets
 
-    # @return [Bool] Whether or not this target should be build.
+    # @return [Array<PBXNativeTarget>] the resource bundle test targets belonging
+    #         to this target.
+    attr_reader :test_resource_bundle_targets
+
+    # @return [Bool] Whether or not this target should be built.
     #
-    # A target should not be build if it has no source files.
+    # A target should not be built if it has no source files.
     #
     def should_build?
+      return @should_build if defined? @should_build
+
+      return @should_build = true if contains_script_phases?
+
       source_files = file_accessors.flat_map(&:source_files)
       source_files -= file_accessors.flat_map(&:headers)
-      !source_files.empty?
+      @should_build = !source_files.empty?
     end
 
     # @return [Array<Specification::Consumer>] the specification consumers for
@@ -134,11 +184,184 @@ module Pod
       specs.map { |spec| spec.consumer(platform) }
     end
 
-    # @return [Boolean] Whether the target uses Swift code
+    # @return [Boolean] Whether the target uses Swift code.
     #
     def uses_swift?
-      file_accessors.any? do |file_accessor|
-        file_accessor.source_files.any? { |sf| sf.extname == '.swift' }
+      return @uses_swift if defined? @uses_swift
+      @uses_swift = begin
+        file_accessors.any? do |file_accessor|
+          file_accessor.source_files.any? { |sf| sf.extname == '.swift' }
+        end
+      end
+    end
+
+    # @return [Boolean] Whether the target defines a "module"
+    #         (and thus will need a module map and umbrella header).
+    #
+    # @note   Static library targets can temporarily opt in to this behavior by setting
+    #         `DEFINES_MODULE = YES` in their specification's `pod_target_xcconfig`.
+    #
+    def defines_module?
+      return @defines_module if defined?(@defines_module)
+      return @defines_module = true if uses_swift? || requires_frameworks?
+      return @defines_module = true if target_definitions.any? { |td| td.build_pod_as_module?(pod_name) }
+
+      @defines_module = non_test_specs.any? { |s| s.consumer(platform).pod_target_xcconfig['DEFINES_MODULE'] == 'YES' }
+    end
+
+    # @return [Array<Hash{Symbol=>String}>] An array of hashes where each hash represents a single script phase.
+    #
+    def script_phases
+      spec_consumers.flat_map(&:script_phases)
+    end
+
+    # @return [Boolean] Whether the target contains any script phases.
+    #
+    def contains_script_phases?
+      !script_phases.empty?
+    end
+
+    # @return [Hash{Array => Specification}] a hash where the keys are the test native targets and the value
+    #         an array of all the test specs associated with this native target.
+    #
+    def test_specs_by_native_target
+      test_specs.group_by { |test_spec| native_target_for_spec(test_spec) }
+    end
+
+    # @return [Boolean] Whether the target has any tests specifications.
+    #
+    def contains_test_specifications?
+      !test_specs.empty?
+    end
+
+    # @return [Array<Specification>] All of the test specs within this target.
+    #
+    attr_reader :test_specs
+
+    # @return [Array<Specification>] All of the specs within this target that are not test specs.
+    #
+    attr_reader :non_test_specs
+
+    # @return [Array<Symbol>] All of the test supported types within this target.
+    #
+    def supported_test_types
+      test_specs.map(&:test_type).uniq
+    end
+
+    # Returns the framework paths associated with this target. By default all paths include the framework paths
+    # that are part of test specifications.
+    #
+    # @param  [Boolean] include_test_spec_paths
+    #         Whether to include framework paths from test specifications or not.
+    #
+    # @return [Array<Hash{Symbol => [String]}>] The vendored and non vendored framework paths
+    #         this target depends upon.
+    #
+    def framework_paths(include_test_spec_paths = true)
+      @framework_paths ||= {}
+      return @framework_paths[include_test_spec_paths] if @framework_paths.key?(include_test_spec_paths)
+      @framework_paths[include_test_spec_paths] = begin
+        accessors = file_accessors
+        accessors = accessors.reject { |a| a.spec.test_specification? } unless include_test_spec_paths
+        frameworks = []
+        accessors.flat_map(&:vendored_dynamic_artifacts).map do |framework_path|
+          relative_path_to_sandbox = framework_path.relative_path_from(sandbox.root)
+          framework = { :name => framework_path.basename.to_s,
+                        :input_path => "${PODS_ROOT}/#{relative_path_to_sandbox}",
+                        :output_path => "${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/#{framework_path.basename}" }
+          # Until this can be configured, assume the dSYM file uses the file name as the framework.
+          # See https://github.com/CocoaPods/CocoaPods/issues/1698
+          dsym_name = "#{framework_path.basename}.dSYM"
+          dsym_path = Pathname.new("#{framework_path.dirname}/#{dsym_name}")
+          if dsym_path.exist?
+            framework[:dsym_name] = dsym_name
+            framework[:dsym_input_path] = "${PODS_ROOT}/#{relative_path_to_sandbox}.dSYM"
+            framework[:dsym_output_path] = "${DWARF_DSYM_FOLDER_PATH}/#{dsym_name}"
+          end
+          frameworks << framework
+        end
+        if should_build? && requires_frameworks? && !static_framework?
+          frameworks << { :name => product_name,
+                          :input_path => build_product_path('${BUILT_PRODUCTS_DIR}'),
+                          :output_path => "${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/#{product_name}" }
+        end
+        frameworks
+      end
+    end
+
+    # Returns the resource paths associated with this target. By default all paths include the resource paths
+    # that are part of test specifications.
+    #
+    # @param  [Boolean] include_test_spec_paths
+    #         Whether to include resource paths from test specifications or not.
+    #
+    # @return [Array<String>] The resource and resource bundle paths this target depends upon.
+    #
+    def resource_paths(include_test_spec_paths = true)
+      @resource_paths ||= {}
+      return @resource_paths[include_test_spec_paths] if @resource_paths.key?(include_test_spec_paths)
+      @resource_paths[include_test_spec_paths] = begin
+        accessors = file_accessors
+        accessors = accessors.reject { |a| a.spec.test_specification? } unless include_test_spec_paths
+        resource_paths = accessors.flat_map do |accessor|
+          accessor.resources.flat_map { |res| "${PODS_ROOT}/#{res.relative_path_from(sandbox.project.path.dirname)}" }
+        end
+        resource_bundles = accessors.flat_map do |accessor|
+          prefix = Generator::XCConfig::XCConfigHelper::CONFIGURATION_BUILD_DIR_VARIABLE
+          prefix = configuration_build_dir unless accessor.spec.test_specification?
+          accessor.resource_bundles.keys.map { |name| "#{prefix}/#{name.shellescape}.bundle" }
+        end
+        resource_paths + resource_bundles
+      end
+    end
+
+    # Returns the corresponding native target to use based on the provided specification.
+    # This is used to figure out whether to add a source file into the library native target or any of the
+    # test native targets.
+    #
+    # @param  [Specification] spec
+    #         The specification to base from in order to find the native target.
+    #
+    # @return [PBXNativeTarget] the native target to use or `nil` if none is found.
+    #
+    def native_target_for_spec(spec)
+      return native_target unless spec.test_specification?
+      test_native_targets.find do |native_target|
+        native_target.symbol_type == product_type_for_test_type(spec.test_type)
+      end
+    end
+
+    # Returns the corresponding native product type to use given the test type.
+    # This is primarily used when creating the native targets in order to produce the correct test bundle target
+    # based on the type of tests included.
+    #
+    # @param  [Symbol] test_type
+    #         The test type to map to provided by the test specification DSL.
+    #
+    # @return [Symbol] The native product type to use.
+    #
+    def product_type_for_test_type(test_type)
+      case test_type
+      when :unit
+        :unit_test_bundle
+      else
+        raise Informative, "Unknown test type `#{test_type}`."
+      end
+    end
+
+    # Returns the corresponding test type given the product type.
+    #
+    # @param  [Symbol] product_type
+    #         The product type to map to a test type.
+    #
+    # @return [Symbol] The native product type to use.
+    #
+    def test_type_for_product_type(product_type)
+      case product_type
+      when :unit_test_bundle
+        :unit
+      else
+        raise Informative, "Unknown product type `#{product_type}`."
       end
     end
 
@@ -163,6 +386,57 @@ module Pod
       "#{label}-#{bundle_name}"
     end
 
+    # @param  [Symbol] test_type
+    #         The test type to use for producing the test label.
+    #
+    # @return [String] The derived name of the test target.
+    #
+    def test_target_label(test_type)
+      "#{label}-#{test_type.capitalize}-Tests"
+    end
+
+    # @param  [Symbol] test_type
+    #         The test type to use for producing the test label.
+    #
+    # @return [String] The label of the app host label to use given the platform and test type.
+    #
+    def app_host_label(test_type)
+      "AppHost-#{Platform.string_name(platform.symbolic_name)}-#{test_type.capitalize}-Tests"
+    end
+
+    # @param  [Symbol] test_type
+    #         The test type this embed frameworks script path is for.
+    #
+    # @return [Pathname] The absolute path of the copy resources script for the given test type.
+    #
+    def copy_resources_script_path_for_test_type(test_type)
+      support_files_dir + "#{test_target_label(test_type)}-resources.sh"
+    end
+
+    # @param  [Symbol] test_type
+    #         The test type this embed frameworks script path is for.
+    #
+    # @return [Pathname] The absolute path of the embed frameworks script for the given test type.
+    #
+    def embed_frameworks_script_path_for_test_type(test_type)
+      support_files_dir + "#{test_target_label(test_type)}-frameworks.sh"
+    end
+
+    # @return [Pathname] the absolute path of the prefix header file.
+    #
+    def prefix_header_path
+      support_files_dir + "#{label}-prefix.pch"
+    end
+
+    # @param  [Symbol] test_type
+    #         The test type prefix header path is for.
+    #
+    # @return [Pathname] the absolute path of the prefix header file for the given test type.
+    #
+    def prefix_header_path_for_test_type(test_type)
+      support_files_dir + "#{test_target_label(test_type)}-prefix.pch"
+    end
+
     # @return [Array<String>] The names of the Pods on which this target
     #         depends.
     #
@@ -170,6 +444,47 @@ module Pod
       spec_consumers.flat_map do |consumer|
         consumer.dependencies.map { |dep| Specification.root_name(dep.name) }
       end.uniq
+    end
+
+    # @return [Array<PodTarget>] the recursive targets that this target has a
+    #         dependency upon.
+    #
+    def recursive_dependent_targets
+      @recursive_dependent_targets ||= begin
+        targets = dependent_targets.clone
+
+        targets.each do |target|
+          target.dependent_targets.each do |t|
+            targets.push(t) unless t == self || targets.include?(t)
+          end
+        end
+
+        targets
+      end
+    end
+
+    # @return [Array<PodTarget>] the recursive targets that this target has a
+    #         test dependency upon.
+    #
+    def recursive_test_dependent_targets
+      @recursive_test_dependent_targets ||= begin
+        targets = test_dependent_targets.clone
+
+        targets.each do |target|
+          target.test_dependent_targets.each do |t|
+            targets.push(t) unless t == self || targets.include?(t)
+          end
+        end
+
+        targets
+      end
+    end
+
+    # @return [Array<PodTarget>] the canonical list of dependent targets this target has a dependency upon.
+    #         This list includes the target itself as well as its recursive dependent and test dependent targets.
+    #
+    def all_dependent_targets
+      [self, *recursive_dependent_targets, *recursive_test_dependent_targets].uniq
     end
 
     # Checks if the target should be included in the build configuration with
@@ -182,13 +497,20 @@ module Pod
     #         The name of the build configuration.
     #
     def include_in_build_config?(target_definition, configuration_name)
+      key = [target_definition.label, configuration_name]
+      if @build_config_cache.key?(key)
+        return @build_config_cache[key]
+      end
+
       whitelists = target_definition_dependencies(target_definition).map do |dependency|
         target_definition.pod_whitelisted_for_configuration?(dependency.name, configuration_name)
       end.uniq
 
       if whitelists.empty?
-        return true
+        @build_config_cache[key] = true
+        true
       elsif whitelists.count == 1
+        @build_config_cache[key] = whitelists.first
         whitelists.first
       else
         raise Informative, "The subspecs of `#{pod_name}` are linked to " \
@@ -203,13 +525,16 @@ module Pod
     # @return [Bool]
     #
     def inhibit_warnings?
+      return @inhibit_warnings if defined? @inhibit_warnings
       whitelists = target_definitions.map do |target_definition|
         target_definition.inhibits_warnings_for_pod?(root_spec.name)
       end.uniq
 
       if whitelists.empty?
-        return false
+        @inhibit_warnings = false
+        false
       elsif whitelists.count == 1
+        @inhibit_warnings = whitelists.first
         whitelists.first
       else
         UI.warn "The pod `#{pod_name}` is linked to different targets " \
@@ -217,19 +542,75 @@ module Pod
           'settings to inhibit warnings. CocoaPods does not currently ' \
           'support different settings and will fall back to your preference ' \
           'set in the root target definition.'
-        return podfile.root_target_definitions.first.inhibits_warnings_for_pod?(root_spec.name)
+        podfile.root_target_definitions.first.inhibits_warnings_for_pod?(root_spec.name)
       end
     end
 
-    # @return [String] The configuration build dir, relevant if the target is
-    #         integrated as framework.
+    # @param  [String] dir
+    #         The directory (which might be a variable) relative to which
+    #         the returned path should be. This must be used if the
+    #         $CONFIGURATION_BUILD_DIR is modified.
     #
-    def configuration_build_dir
-      if scoped?
-        "$(BUILD_DIR)/$(CONFIGURATION)$(EFFECTIVE_PLATFORM_NAME)/#{target_definitions.first.label}"
-      else
-        '$(BUILD_DIR)/$(CONFIGURATION)$(EFFECTIVE_PLATFORM_NAME)'
+    # @return [String] The absolute path to the configuration build dir
+    #
+    def configuration_build_dir(dir = Generator::XCConfig::XCConfigHelper::CONFIGURATION_BUILD_DIR_VARIABLE)
+      "#{dir}/#{label}"
+    end
+
+    # @param  [String] dir
+    #         @see #configuration_build_dir
+    #
+    # @return [String] The absolute path to the build product
+    #
+    def build_product_path(dir = Generator::XCConfig::XCConfigHelper::CONFIGURATION_BUILD_DIR_VARIABLE)
+      "#{configuration_build_dir(dir)}/#{product_name}"
+    end
+
+    # @return [String] The source path of the root for this target relative to `$(PODS_ROOT)`
+    #
+    def pod_target_srcroot
+      "${PODS_ROOT}/#{sandbox.pod_dir(pod_name).relative_path_from(sandbox.root)}"
+    end
+
+    # @return [String] The version associated with this target
+    #
+    def version
+      version = root_spec.version
+      [version.major, version.minor, version.patch].join('.')
+    end
+
+    # @param [Boolean] include_test_dependent_targets
+    #        whether to include header search paths for test dependent targets
+    #
+    # @return [Array<String>] The set of header search paths this target uses.
+    #
+    def header_search_paths(include_test_dependent_targets = false)
+      header_search_paths = []
+      header_search_paths.concat(build_headers.search_paths(platform, nil, uses_modular_headers?))
+      header_search_paths.concat(sandbox.public_headers.search_paths(platform, pod_name, uses_modular_headers?))
+      dependent_targets = recursive_dependent_targets
+      dependent_targets += recursive_test_dependent_targets if include_test_dependent_targets
+      dependent_targets.each do |dependent_target|
+        header_search_paths.concat(sandbox.public_headers.search_paths(platform, dependent_target.pod_name, defines_module? && dependent_target.uses_modular_headers?(false)))
       end
+      header_search_paths.uniq
+    end
+
+    protected
+
+    # Returns whether the pod target should use modular headers.
+    #
+    # @param  [Boolean] only_if_defines_modules
+    #         whether the use of modular headers should require the target to define a module
+    #
+    # @note  This must return false when a pod has a `header_mappings_dir`,
+    #        as that allows the spec to completely customize the header structure, and
+    #        therefore it might not be expecting the module name to be prepended
+    #        to imports at all.
+    #
+    def uses_modular_headers?(only_if_defines_modules = true)
+      return false if only_if_defines_modules && !defines_module?
+      spec_consumers.none?(&:header_mappings_dir)
     end
 
     private

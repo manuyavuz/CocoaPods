@@ -1,3 +1,5 @@
+autoload :MachO, 'macho'
+
 module Pod
   class Sandbox
     # Resolves the file patterns of a specification against its root directory,
@@ -15,6 +17,8 @@ module Pod
         :license             => 'licen{c,s}e{*,.*}'.freeze,
         :source_files        => "*{#{SOURCE_FILE_EXTENSIONS.join(',')}}".freeze,
         :public_header_files => "*{#{HEADER_EXTENSIONS.join(',')}}".freeze,
+        :podspecs            => '*.{podspec,podspec.json}'.freeze,
+        :docs                => 'doc{s}{*,.*}/**/*'.freeze,
       }.freeze
 
       # @return [Sandbox::PathList] the directory where the source of the Pod
@@ -259,8 +263,8 @@ module Pod
       # @return [Pathname] The of the prefix header file of the specification.
       #
       def prefix_header
-        if spec_consumer.prefix_header_file
-          path_list.root + spec_consumer.prefix_header_file
+        if file = spec_consumer.prefix_header_file
+          path_list.root + file
         end
       end
 
@@ -274,19 +278,63 @@ module Pod
       #         specification or auto-detected.
       #
       def license
-        if spec_consumer.spec.root.license[:file]
-          path_list.root + spec_consumer.spec.root.license[:file]
-        else
-          path_list.glob([GLOB_PATTERNS[:license]]).first
-        end
+        spec_license || path_list.glob([GLOB_PATTERNS[:license]]).first
       end
 
       # @return [Pathname, Nil] The path of the custom module map file of the
       #         specification, if specified.
       def module_map
-        if module_map = spec_consumer.spec.root.module_map
+        if module_map = spec_consumer.module_map
           path_list.root + module_map
         end
+      end
+
+      # @return [Array<Pathname>] The paths of auto-detected podspecs
+      #
+      def specs
+        path_list.glob([GLOB_PATTERNS[:podspecs]])
+      end
+
+      # @return [Array<Pathname>] The paths of auto-detected docs
+      #
+      def docs
+        path_list.glob([GLOB_PATTERNS[:docs]])
+      end
+
+      # @return [Pathname] The path of the license file specified in the
+      #         specification, if it exists
+      #
+      def spec_license
+        if file = spec_consumer.license[:file]
+          absolute_path = root + file
+          absolute_path if File.exist?(absolute_path)
+        end
+      end
+
+      # @return [Array<Pathname>] Paths to include for local pods to assist in development
+      #
+      def developer_files
+        podspecs = specs
+        result = [module_map, prefix_header]
+
+        if license_path = spec_consumer.license[:file]
+          license_path = root + license_path
+          unless File.exist?(license_path)
+            UI.warn "A license was specified in podspec `#{spec.name}` but the file does not exist - #{license_path}"
+          end
+        end
+
+        if podspecs.size <= 1
+          result += [license, readme, podspecs, docs]
+        else
+          # Manually add non-globbing files since there are multiple podspecs in the same folder
+          result << podspec_file
+          if license_file = spec_license
+            absolute_path = root + license_file
+            result << absolute_path if File.exist?(absolute_path)
+          end
+        end
+        result.compact.flatten.sort
       end
 
       #-----------------------------------------------------------------------#
@@ -307,6 +355,12 @@ module Pod
       #
       def private_header_files
         paths_for_attribute(:private_header_files)
+      end
+
+      # @return [Pathname] The path of the podspec matching @spec
+      #
+      def podspec_file
+        specs.lazy.select { |p| File.basename(p.to_s, '.*') == spec.name }.first
       end
 
       #-----------------------------------------------------------------------#
@@ -370,9 +424,13 @@ module Pod
       # @return [Boolean] Whether `binary` can be dynamically linked.
       #
       def dynamic_binary?(binary)
-        return unless binary.file?
-        output, status = Executable.capture_command('file', [binary], :capture => :out)
-        status.success? && output =~ /dynamically linked/
+        @cached_dynamic_binary_results ||= {}
+        return @cached_dynamic_binary_results[binary] unless @cached_dynamic_binary_results[binary].nil?
+        return false unless binary.file?
+
+        @cached_dynamic_binary_results[binary] = MachO.open(binary).dylib?
+      rescue MachO::MachOError
+        @cached_dynamic_binary_results[binary] = false
       end
 
       #-----------------------------------------------------------------------#

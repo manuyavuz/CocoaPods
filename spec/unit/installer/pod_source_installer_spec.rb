@@ -23,15 +23,6 @@ module Pod
           pod_folder.should.exist
         end
 
-        it 'downloads the head source even if a specific source is present specified source' do
-          config.sandbox.store_head_pod('BananaLib')
-          @spec.source = { :git => SpecHelper.fixture('banana-lib'), :tag => 'v1.0' }
-          @installer.install!
-          @installer.specific_source[:commit].should == FIXTURE_HEAD
-          pod_folder = config.sandbox.pod_dir('BananaLib')
-          pod_folder.should.exist
-        end
-
         it 'returns the checkout options of the downloader if any' do
           @spec.source = { :git => SpecHelper.fixture('banana-lib'), :branch => 'topicbranch' }
           @installer.install!
@@ -39,27 +30,22 @@ module Pod
           pod_folder = config.sandbox.pod_dir('BananaLib')
           pod_folder.should.exist
         end
+      end
 
-        it 'stores the checkout options in the sandbox' do
-          config.sandbox.store_head_pod('BananaLib')
-          @spec.source = { :git => SpecHelper.fixture('banana-lib'), :tag => 'v1.0' }
-          @installer.install!
-          sources = @installer.sandbox.checkout_sources
-          sources.should == { 'BananaLib' => {
-            :git => SpecHelper.fixture('banana-lib'),
-            :commit => FIXTURE_HEAD },
-          }
-        end
+      it 'does not show warning if the source is encrypted using https' do
+        @spec.source = { :http => 'https://orta.io/sdk.zip' }
+        dummy_response = Pod::Downloader::Response.new
+        Downloader.stubs(:download).returns(dummy_response)
+        @installer.install!
+        UI.warnings.length.should.equal(0)
+      end
 
-        it 'fails when using :head for http source' do
-          config.sandbox.store_head_pod('BananaLib')
-          @spec.source = { :http => 'http://dl.google.com/googleadmobadssdk/googleadmobsearchadssdkios.zip' }
-          @spec.source_files = 'GoogleAdMobSearchAdsSDK/*.h'
-          Pod::Downloader::Http.any_instance.stubs(:download_head)
-          should.raise Informative do
-            @installer.install!
-          end.message.should.match /does not support the :head option, as it uses a Http source./
-        end
+      it 'shows a warning if the source is unencrypted (e.g. http)' do
+        @spec.source = { :http => 'http://orta.io/sdk.zip' }
+        dummy_response = Pod::Downloader::Response.new
+        Downloader.stubs(:download).returns(dummy_response)
+        @installer.install!
+        UI.warnings.should.include 'Please reach out to the library author to notify them of this security issue'
       end
 
       #--------------------------------------#
@@ -87,6 +73,18 @@ module Pod
           ENV['CDPATH'] = 'BogusPath'
           @spec.prepare_command = 'cd Classes;ls Banana.h'
           lambda { @installer.install! }.should.not.raise
+        end
+
+        it 'sets the $COCOAPODS_VERSION environment variable' do
+          @spec.prepare_command = "[ \"$COCOAPODS_VERSION\" == \"#{Pod::VERSION}\" ] || exit 1"
+          lambda { @installer.install! }.should.not.raise
+        end
+
+        it 'doesn\'t leak the $COCOAPODS_VERSION environment variable' do
+          ENV['COCOAPODS_VERSION'] = nil
+          @spec.prepare_command = 'exit 1'
+          lambda { @installer.install! }.should.raise(Pod::Informative)
+          ENV['COCOAPODS_VERSION'].should.be.nil
         end
       end
 

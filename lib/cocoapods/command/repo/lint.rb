@@ -2,7 +2,7 @@ module Pod
   class Command
     class Repo < Command
       class Lint < Repo
-        self.summary = 'Validates all specs in a repo.'
+        self.summary = 'Validates all specs in a repo'
 
         self.description = <<-DESC
           Lints the spec-repo `NAME`. If a directory is provided it is assumed
@@ -34,15 +34,19 @@ module Pod
         # @todo add UI.print and enable print statements again.
         #
         def run
-          if @name
-            sources = SourcesManager.sources([@name])
-          else
-            sources = SourcesManager.aggregate.sources
-          end
+          sources = if @name
+                      if File.exist?(@name)
+                        [Source.new(Pathname(@name))]
+                      else
+                        config.sources_manager.sources([@name])
+                      end
+                    else
+                      config.sources_manager.all
+                    end
 
           sources.each do |source|
-            SourcesManager.check_version_information(source.repo)
-            UI.puts "\nLinting spec repo `#{source.repo.basename}`\n".yellow
+            source.verify_compatibility!
+            UI.puts "\nLinting spec repo `#{source.name}`\n".yellow
 
             validator = Source::HealthReporter.new(source.repo)
             validator.pre_check do |_name, _version|

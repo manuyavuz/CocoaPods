@@ -5,10 +5,10 @@ module Pod
     before do
       project_path = SpecHelper.create_sample_app_copy_from_fixture('SampleProject')
       @project = Xcodeproj::Project.open(project_path)
-      Xcodeproj::Project.new(config.sandbox.project_path).save
+      Project.new(config.sandbox.project_path).save
       @target = @project.targets.first
       target_definition = Podfile::TargetDefinition.new('Pods', nil)
-      target_definition.link_with_first_target = true
+      target_definition.abstract = false
       @pod_bundle = AggregateTarget.new(target_definition, config.sandbox)
       @pod_bundle.user_project = @project
       @pod_bundle.client_root = project_path.dirname
@@ -89,6 +89,20 @@ module Pod
       UI.warnings.should.not.match /not set.*base configuration/
     end
 
+    it 'does not log a warning if the existing xcconfig is identical to the Pods config' do
+      sample_config = @project.new_file('SampleConfig.xcconfig')
+      File.write(sample_config.real_path, 'sample config content.')
+      @target.build_configurations.each do |config|
+        config.base_configuration_reference = sample_config
+      end
+      XCConfigIntegrator.integrate(@pod_bundle, [@target])
+      @target.build_configurations.each do |config|
+        config.base_configuration_reference.should == sample_config
+      end
+
+      UI.warnings.should.not.match /not set.*base configuration/
+    end
+
     it 'does not log a warning if the user has set a xcconfig of their own that includes the silence warnings string' do
       SILENCE_TOKEN = '// @COCOAPODS_SILENCE_WARNINGS@ //'
       sample_config = @project.new_file('SampleConfig.xcconfig')
@@ -104,6 +118,33 @@ module Pod
       end
 
       UI.warnings.should.not.match /not set.*base configuration/
+    end
+
+    it 'handles when xcconfig is set to another sandbox xcconfig' do
+      group = @project.new_group('Pods')
+
+      old_config = group.new_file('../Pods/Target Support Files/Pods-Foo/SampleConfig.xcconfig')
+      @target.build_configurations.each do |config|
+        config.base_configuration_reference = old_config
+      end
+      XCConfigIntegrator.integrate(@pod_bundle, [@target])
+      @target.build_configurations.each do |config|
+        config.base_configuration_reference.should.not == old_config
+        config.base_configuration_reference.path.should == @pod_bundle.xcconfig_relative_path(config.name)
+      end
+
+      @pod_bundle.stubs(:label).returns('Pods-Foo')
+      old_config = group.new_file('../Pods/Target Support Files/Pods/SampleConfig.xcconfig')
+      @target.build_configurations.each do |config|
+        config.base_configuration_reference = old_config
+      end
+      XCConfigIntegrator.integrate(@pod_bundle, [@target])
+      @target.build_configurations.each do |config|
+        config.base_configuration_reference.should.not == old_config
+        config.base_configuration_reference.path.should == @pod_bundle.xcconfig_relative_path(config.name)
+      end
+
+      UI.warnings.should.be.empty
     end
   end
 end

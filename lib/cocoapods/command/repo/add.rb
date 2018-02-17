@@ -2,7 +2,7 @@ module Pod
   class Command
     class Repo < Command
       class Add < Repo
-        self.summary = 'Add a spec repo.'
+        self.summary = 'Add a spec repo'
 
         self.description = <<-DESC
           Clones `URL` in the local spec-repos directory at `~/.cocoapods/repos/`. The
@@ -17,15 +17,15 @@ module Pod
 
         def self.options
           [
-            ['--shallow', 'Create a shallow clone (fast clone, but no push capabilities)'],
+            ['--progress', 'Show the progress of cloning the spec repository'],
           ].concat(super)
         end
 
         def initialize(argv)
-          @shallow = argv.flag?('shallow', false)
           @name = argv.shift_argument
           @url = argv.shift_argument
           @branch = argv.shift_argument
+          @progress = argv.flag?('progress')
           super
         end
 
@@ -34,15 +34,20 @@ module Pod
           unless @name && @url
             help! 'Adding a repo needs a `NAME` and a `URL`.'
           end
+          if @name == 'master' || @url =~ %r{github.com[:/]+cocoapods/specs}i
+            raise Informative,
+                  'To setup the master specs repo, please run `pod setup`.'
+          end
         end
 
         def run
-          prefix = @shallow ? 'Creating shallow clone of' : 'Cloning'
-          UI.section("#{prefix} spec repo `#{@name}` from `#{@url}`#{" (branch `#{@branch}`)" if @branch}") do
+          section = "Cloning spec repo `#{@name}` from `#{@url}`"
+          section << " (branch `#{@branch}`)" if @branch
+          UI.section(section) do
             create_repos_dir
             clone_repo
             checkout_branch
-            SourcesManager.check_version_information(dir)
+            config.sources_manager.sources([dir.basename.to_s]).each(&:verify_compatibility!)
           end
         end
 
@@ -68,10 +73,20 @@ module Pod
         # @return [void]
         #
         def clone_repo
-          Dir.chdir(config.repos_dir) do
-            command = ['clone', @url, @name]
-            command << '--depth=1' if @shallow
-            git!(command)
+          changes = if @progress
+                      { :verbose => true }
+                    else
+                      {}
+          end
+
+          config.with_changes(changes) do
+            Dir.chdir(config.repos_dir) do
+              command = ['clone', @url, @name]
+              if @progress
+                command << '--progress'
+              end
+              git!(command)
+            end
           end
         end
 

@@ -4,8 +4,7 @@ module Pod
   describe Pod::AggregateTarget do
     describe 'In general' do
       before do
-        @target_definition = Podfile::TargetDefinition.new('Pods', nil)
-        @target_definition.link_with_first_target = true
+        @target_definition = fixture_target_definition
         @lib = AggregateTarget.new(@target_definition, config.sandbox)
       end
 
@@ -28,8 +27,7 @@ module Pod
 
     describe 'Support files' do
       before do
-        @target_definition = Podfile::TargetDefinition.new('Pods', nil)
-        @target_definition.link_with_first_target = true
+        @target_definition = fixture_target_definition
         @lib = AggregateTarget.new(@target_definition, config.sandbox)
         @lib.client_root = config.sandbox.root.dirname
       end
@@ -40,10 +38,6 @@ module Pod
 
       it 'returns the absolute path of the resources script' do
         @lib.copy_resources_script_path.to_s.should.include?('Pods/Target Support Files/Pods/Pods-resources.sh')
-      end
-
-      it 'returns the absolute path of the prefix header file' do
-        @lib.prefix_header_path.to_s.should.include?('Pods/Target Support Files/Pods/Pods-prefix.pch')
       end
 
       it 'returns the absolute path of the bridge support file' do

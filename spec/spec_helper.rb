@@ -44,6 +44,7 @@ require 'spec_helper/temporary_repos' # Allows to create and modify temporary sp
 require 'spec_helper/temporary_cache' # Allows to create temporary cache directory.
 require 'spec_helper/user_interface'  # Redirects UI to UI.output & UI.warnings.
 require 'spec_helper/pre_flight'      # Cleans the temporary directory, the config & the UI.output before every test.
+require 'spec_helper/webmock'         # Cleans up mocks after each spec
 
 #-----------------------------------------------------------------------------#
 
@@ -116,17 +117,28 @@ def fixture_file_accessor(spec_or_name, platform = Pod::Platform.ios)
 end
 
 def fixture_target_definition(name = 'Pods', platform = Pod::Platform.ios)
-  Pod::Podfile::TargetDefinition.new(name, Pod::Podfile.new, 'name' => name, 'platform' => platform)
+  platform_hash = { platform.symbolic_name => platform.deployment_target }
+  parent = Pod::Podfile.new
+  Pod::Podfile::TargetDefinition.new(name, parent,
+                                     'abstract' => false,
+                                     'name' => name,
+                                     'platform' => platform_hash)
 end
 
-def fixture_pod_target(spec_or_name, target_definition = nil)
+def fixture_pod_target(spec_or_name, target_definitions = [])
   spec = spec_or_name.is_a?(Pod::Specification) ? spec_or_name : fixture_spec(spec_or_name)
-  target_definition ||= fixture_target_definition
-  target_definition.store_pod(spec.name)
-  Pod::PodTarget.new([spec], [target_definition], config.sandbox).tap do |pod_target|
-    pod_target.file_accessors << fixture_file_accessor(spec, pod_target.platform)
-    consumer = spec.consumer(pod_target.platform)
-    pod_target.spec_consumers << consumer
+  fixture_pod_target_with_specs([spec], target_definitions)
+end
+
+def fixture_pod_target_with_specs(specs, target_definitions = [])
+  target_definitions << fixture_target_definition if target_definitions.empty?
+  target_definitions.each { |td| specs.each { |spec| td.store_pod(spec.name) } }
+  Pod::PodTarget.new(specs, target_definitions, config.sandbox).tap do |pod_target|
+    specs.each do |spec|
+      pod_target.file_accessors << fixture_file_accessor(spec, pod_target.platform)
+      consumer = spec.consumer(pod_target.platform)
+      pod_target.spec_consumers << consumer
+    end
   end
 end
 

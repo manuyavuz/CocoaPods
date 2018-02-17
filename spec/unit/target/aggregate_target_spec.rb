@@ -5,7 +5,7 @@ module Pod
     describe 'In general' do
       before do
         @target_definition = Podfile::TargetDefinition.new('Pods', nil)
-        @target_definition.link_with_first_target = true
+        @target_definition.abstract = false
         @target = AggregateTarget.new(@target_definition, config.sandbox)
       end
 
@@ -42,7 +42,7 @@ module Pod
     describe 'Support files' do
       before do
         @target_definition = Podfile::TargetDefinition.new('Pods', nil)
-        @target_definition.link_with_first_target = true
+        @target_definition.abstract = false
         @target = AggregateTarget.new(@target_definition, config.sandbox)
         @target.client_root = config.sandbox.root.dirname
       end
@@ -57,10 +57,6 @@ module Pod
 
       it 'returns the absolute path of the frameworks script' do
         @target.embed_frameworks_script_path.to_s.should.include?('Pods/Target Support Files/Pods/Pods-frameworks.sh')
-      end
-
-      it 'returns the absolute path of the prefix header file' do
-        @target.prefix_header_path.to_s.should.include?('Pods/Target Support Files/Pods/Pods-prefix.pch')
       end
 
       it 'returns the absolute path of the bridge support file' do
@@ -83,8 +79,8 @@ module Pod
         @target.xcconfig_relative_path('Release').should == 'Pods/Target Support Files/Pods/Pods.release.xcconfig'
       end
 
-      it 'returns the path for the CONFIGURATION_BUILD_DIR build setting' do
-        @target.scoped_configuration_build_dir.should == '$(BUILD_DIR)/$(CONFIGURATION)$(EFFECTIVE_PLATFORM_NAME)/Pods'
+      it 'returns the path of output file for the check pod manifest file  script' do
+        @target.check_manifest_lock_script_output_file_path.should == '$(DERIVED_FILE_DIR)/Pods-checkManifestLockResult.txt'
       end
     end
 
@@ -92,9 +88,10 @@ module Pod
       before do
         @spec = fixture_spec('banana-lib/BananaLib.podspec')
         @target_definition = Podfile::TargetDefinition.new('Pods', nil)
+        @target_definition.abstract = false
+        @target_definition.set_platform(:ios, '10.0')
         @pod_target = PodTarget.new([@spec], [@target_definition], config.sandbox)
         @target = AggregateTarget.new(@target_definition, config.sandbox)
-        @target.stubs(:platform).returns(:ios)
         @target.pod_targets = [@pod_target]
       end
 
@@ -120,6 +117,122 @@ module Pod
             'Debug' => @pod_target.specs,
             'Release' => (@pod_target.specs + @pod_target_release.specs),
           }
+        end
+      end
+
+      describe 'frameworks by config and input output paths' do
+        before do
+          @coconut_spec = fixture_spec('coconut-lib/CoconutLib.podspec')
+          @pod_target_release = PodTarget.new([@coconut_spec], [@target_definition], config.sandbox)
+          @target.pod_targets = [@pod_target]
+          @target.user_build_configurations = {
+            'Debug' => :debug,
+            'Release' => :release,
+          }
+        end
+
+        it 'returns non vendored framework input and output paths by config' do
+          @pod_target.stubs(:should_build?).returns(true)
+          @pod_target.stubs(:requires_frameworks?).returns(true)
+          @target.framework_paths_by_config['Debug'].should == [
+            { :name => 'BananaLib.framework',
+              :input_path => '${BUILT_PRODUCTS_DIR}/BananaLib/BananaLib.framework',
+              :output_path => '${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/BananaLib.framework' },
+          ]
+          @target.framework_paths_by_config['Release'].should == [
+            { :name => 'BananaLib.framework',
+              :input_path => '${BUILT_PRODUCTS_DIR}/BananaLib/BananaLib.framework',
+              :output_path => '${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/BananaLib.framework' },
+          ]
+        end
+
+        it 'checks resource paths are empty for dynamic frameworks' do
+          @pod_target.stubs(:should_build?).returns(true)
+          @pod_target.stubs(:requires_frameworks?).returns(true)
+          @pod_target.stubs(:static_framework?).returns(false)
+          @pod_target.stubs(:resource_paths).returns(['MyResources.bundle'])
+          @target.stubs(:bridge_support_file).returns(nil)
+          resource_paths_by_config = @target.resource_paths_by_config
+          resource_paths_by_config['Debug'].should.be.empty
+          resource_paths_by_config['Release'].should.be.empty
+        end
+
+        it 'checks resource paths are included for static frameworks' do
+          @pod_target.stubs(:should_build?).returns(true)
+          @pod_target.stubs(:requires_frameworks?).returns(true)
+          @pod_target.stubs(:static_framework?).returns(true)
+          @pod_target.stubs(:resource_paths).returns(['MyResources.bundle'])
+          @target.stubs(:bridge_support_file).returns(nil)
+          resource_paths_by_config = @target.resource_paths_by_config
+          resource_paths_by_config['Debug'].should == ['MyResources.bundle']
+          resource_paths_by_config['Release'].should == ['MyResources.bundle']
+        end
+
+        it 'returns non vendored frameworks by config with different release and debug targets' do
+          @pod_target_release.stubs(:should_build?).returns(true)
+          @pod_target_release.stubs(:requires_frameworks?).returns(true)
+          @pod_target_release.expects(:include_in_build_config?).with(@target_definition, 'Debug').returns(false)
+          @pod_target_release.expects(:include_in_build_config?).with(@target_definition, 'Release').returns(true)
+          @pod_target.stubs(:should_build?).returns(true)
+          @pod_target.stubs(:requires_frameworks?).returns(true)
+          @target.pod_targets = [@pod_target, @pod_target_release]
+          framework_paths_by_config = @target.framework_paths_by_config
+          framework_paths_by_config['Debug'].should == [
+            { :name => 'BananaLib.framework',
+              :input_path => '${BUILT_PRODUCTS_DIR}/BananaLib/BananaLib.framework',
+              :output_path => '${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/BananaLib.framework' },
+          ]
+          framework_paths_by_config['Release'].should == [
+            { :name => 'BananaLib.framework',
+              :input_path => '${BUILT_PRODUCTS_DIR}/BananaLib/BananaLib.framework',
+              :output_path => '${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/BananaLib.framework' },
+            { :name => 'CoconutLib.framework',
+              :input_path => '${BUILT_PRODUCTS_DIR}/CoconutLib/CoconutLib.framework',
+              :output_path => '${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/CoconutLib.framework' },
+          ]
+        end
+
+        it 'returns vendored frameworks by config' do
+          path_list = Sandbox::PathList.new(fixture('banana-lib'))
+          file_accessor = Sandbox::FileAccessor.new(path_list, @spec.consumer(:ios))
+          @pod_target.file_accessors = [file_accessor]
+          @pod_target.file_accessors.first.stubs(:vendored_dynamic_artifacts).returns(
+            [Pathname('/some/absolute/path/to/FrameworkA.framework')],
+          )
+          @target.framework_paths_by_config['Debug'].should == [
+            { :name => 'FrameworkA.framework',
+              :input_path => '${PODS_ROOT}/../../../../../../../some/absolute/path/to/FrameworkA.framework',
+              :output_path => '${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/FrameworkA.framework' },
+          ]
+        end
+
+        it 'returns correct input and output paths for non vendored frameworks' do
+          @pod_target.stubs(:should_build?).returns(true)
+          @pod_target.stubs(:requires_frameworks?).returns(true)
+          @target.framework_paths_by_config['Debug'].should == [
+            { :name => 'BananaLib.framework',
+              :input_path => '${BUILT_PRODUCTS_DIR}/BananaLib/BananaLib.framework',
+              :output_path => '${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/BananaLib.framework' },
+          ]
+          @target.framework_paths_by_config['Release'].should == [
+            { :name => 'BananaLib.framework',
+              :input_path => '${BUILT_PRODUCTS_DIR}/BananaLib/BananaLib.framework',
+              :output_path => '${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/BananaLib.framework' },
+          ]
+        end
+
+        it 'returns correct input and output paths for vendored frameworks' do
+          path_list = Sandbox::PathList.new(fixture('banana-lib'))
+          file_accessor = Sandbox::FileAccessor.new(path_list, @spec.consumer(:ios))
+          @pod_target.file_accessors = [file_accessor]
+          @pod_target.file_accessors.first.stubs(:vendored_dynamic_artifacts).returns(
+            [Pathname('/absolute/path/to/FrameworkA.framework')],
+          )
+          @target.framework_paths_by_config['Debug'].should == [
+            { :name => 'FrameworkA.framework',
+              :input_path => '${PODS_ROOT}/../../../../../../../absolute/path/to/FrameworkA.framework',
+              :output_path => '${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/FrameworkA.framework' },
+          ]
         end
       end
 
@@ -196,11 +309,108 @@ module Pod
             @target.requires_frameworks?.should == false
           end
         end
+
+        describe 'Target might require a host target' do
+          before do
+            target_definition = Podfile::TargetDefinition.new('Pods', nil)
+            target_definition.abstract = false
+            @target = AggregateTarget.new(target_definition, config.sandbox)
+            project_path = SpecHelper.fixture('SampleProject/SampleProject.xcodeproj')
+            @target.user_project = Xcodeproj::Project.open(project_path)
+            @target.user_target_uuids = ['A346496C14F9BE9A0080D870']
+          end
+
+          it 'requires a host target for app extension targets' do
+            @target.user_targets.first.stubs(:symbol_type).returns(:app_extension)
+            @target.requires_host_target?.should == true
+          end
+
+          it 'requires a host target for watch extension targets' do
+            @target.user_targets.first.stubs(:symbol_type).returns(:watch_extension)
+            @target.requires_host_target?.should == true
+          end
+
+          it 'requires a host target for framework targets' do
+            @target.user_targets.first.stubs(:symbol_type).returns(:framework)
+            @target.requires_host_target?.should == true
+          end
+
+          it 'requires a host target for messages extension targets' do
+            @target.user_targets.first.stubs(:symbol_type).returns(:messages_extension)
+            @target.requires_host_target?.should == true
+          end
+
+          it 'requires a host target for XPC service targets' do
+            @target.user_targets.first.stubs(:symbol_type).returns(:xpc_service)
+            @target.requires_host_target?.should == true
+          end
+
+          it 'does not require a host target for watch 2 extension targets' do
+            @target.user_targets.first.stubs(:symbol_type).returns(:watch2_extension)
+            @target.requires_host_target?.should == false
+          end
+
+          it 'does not require a host target for application targets' do
+            @target.user_targets.first.stubs(:symbol_type).returns(:application)
+            @target.requires_host_target?.should == false
+          end
+
+          it 'does not require a host target, if there is no user project (manual integration)' do
+            @target.user_project = nil
+            @target.user_target_uuids = []
+            @target.requires_host_target?.should == false
+          end
+
+          it 'raises an exception if more than one kind of user_target is found' do
+            @target.user_target_uuids << '51075D491521D0C100E39B41'
+            @target.user_targets.first.stubs(:symbol_type).returns(:app_extension)
+            @target.user_targets.last.stubs(:symbol_type).returns(:watch_extension)
+            should.raise ArgumentError do
+              @target.requires_host_target?
+            end.message.should.equal 'Expected single kind of user_target for Pods. Found app_extension, watch_extension.'
+          end
+        end
+      end
+
+      describe 'Target might be a library target' do
+        before do
+          target_definition = Podfile::TargetDefinition.new('Pods', nil)
+          target_definition.abstract = false
+          @target = AggregateTarget.new(target_definition, config.sandbox)
+          project_path = SpecHelper.fixture('SampleProject/SampleProject.xcodeproj')
+          @target.user_project = Xcodeproj::Project.open(project_path)
+          @target.user_target_uuids = ['A346496C14F9BE9A0080D870']
+        end
+
+        it 'is a library target if the user_target is a framework' do
+          @target.user_targets.first.stubs(:symbol_type).returns(:framework)
+          @target.library?.should == true
+        end
+
+        it 'is a library target if the user_target is a static library' do
+          @target.user_targets.first.stubs(:symbol_type).returns(:static_library)
+          @target.library?.should == true
+        end
+
+        it 'is a library target if the user_target is a dynamic library' do
+          @target.user_targets.first.stubs(:symbol_type).returns(:dynamic_library)
+          @target.library?.should == true
+        end
+
+        it 'is not a library target if the user_target is an application' do
+          @target.user_targets.first.stubs(:symbol_type).returns(:application)
+          @target.library?.should == false
+        end
+
+        it 'is not a library target if the user_target is an app extension' do
+          @target.user_targets.first.stubs(:symbol_type).returns(:app_extension)
+          @target.library?.should == false
+        end
       end
 
       describe 'With frameworks' do
         before do
-          @pod_target = fixture_pod_target('orange-framework/OrangeFramework.podspec', fixture_target_definition('iOS Example'))
+          @pod_target = fixture_pod_target('orange-framework/OrangeFramework.podspec', [fixture_target_definition('iOS Example')])
           @target = AggregateTarget.new(@pod_target.target_definitions.first, config.sandbox)
           @target.stubs(:requires_frameworks?).returns(true)
           @target.pod_targets = [@pod_target]

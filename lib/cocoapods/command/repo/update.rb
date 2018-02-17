@@ -2,7 +2,7 @@ module Pod
   class Command
     class Repo < Command
       class Update < Repo
-        self.summary = 'Update a spec repo.'
+        self.summary = 'Update a spec repo'
 
         self.description = <<-DESC
           Updates the local clone of the spec-repo `NAME`. If `NAME` is omitted
@@ -19,7 +19,8 @@ module Pod
         end
 
         def run
-          SourcesManager.update(@name, true)
+          show_output = !config.silent?
+          config.sources_manager.update(@name, show_output)
         end
       end
     end
